@@ -47,8 +47,8 @@ from vault.import_app.import_engine import (
     _durable_flush_batch, _hash_source_line, _write_ledger_entries,
 )
 from vault.models import (
-    Account, Email, ImportJob, ImportRecord, ImportRecoveryLog, Ip, Pass,
-    Url, User, record_fingerprint,
+    Account, Email, ImportJob, ImportRecord, ImportRecoveryLog,
+    ImportStageRecord, Ip, Pass, Url, User, record_fingerprint,
 )
 from vault.utils import MAX_SOURCE_LINE_BYTES, parse_line
 
@@ -300,6 +300,32 @@ class ImportJobModelTests(TestCase):
         job.total_failed = 10
         
         self.assertEqual(job.progress_percent, 90.0)
+
+    def test_retryable_failed_stage_is_not_counted_twice_in_progress(self):
+        job = create_import_job(source_name='retryable-stage.txt')
+        job.total_discovered = 2
+        job.total_attempted = 1
+        job.save(update_fields=['total_discovered', 'total_attempted'])
+        record = ImportRecord.objects.create(
+            import_job=job,
+            source_position=1,
+            source_hash='synthetic-hash',
+            status='failed',
+            retryable=True,
+            idempotency_key=ImportRecord.compute_idempotency_key(
+                job.job_id, 1,
+            ),
+        )
+        ImportStageRecord.objects.create(
+            import_record=record,
+            url='https://retryable-stage.example/login',
+            account_type='user',
+            ident='retryable-user',
+            secret='synthetic-retryable-secret',
+        )
+
+        self.assertEqual(job.total_staged, 1)
+        self.assertEqual(job.progress_percent, 50.0)
 
 
 class ImportRecordModelTests(TestCase):
@@ -712,20 +738,20 @@ class CrashRecoveryTests(TestCase):
 
     def _kill_worker_after(self, job, committed_batches, batch_rows=3):
         """Run the durable import, killing the worker right after the
-        given number of batch flushes -- after the database commit, but
-        before the session (the caller) has processed the result."""
-        real_flush = import_engine._durable_flush_batch
-        state = {'flushed': 0}
+        given number of staging transactions -- after accepted rows are
+        durably staged, but before the session receives acknowledgement."""
+        real_stage = import_engine._durable_stage_batch
+        state = {'staged': 0}
 
-        def crashing_flush(rows, record_metas, job_pk, **kw):
-            committed = real_flush(rows, record_metas, job_pk, **kw)
-            state['flushed'] += 1
-            if state['flushed'] >= committed_batches:
+        def crashing_stage(rows, record_metas, job_pk, **kw):
+            staged = real_stage(rows, record_metas, job_pk, **kw)
+            state['staged'] += 1
+            if state['staged'] >= committed_batches:
                 raise _SimulatedWorkerKill()
-            return committed
+            return staged
 
         with mock.patch.object(
-            import_engine, '_durable_flush_batch', crashing_flush
+            import_engine, '_durable_stage_batch', crashing_stage
         ):
             with self.assertRaises(_SimulatedWorkerKill):
                 durable_import_file(
@@ -740,18 +766,19 @@ class CrashRecoveryTests(TestCase):
         )
         self._kill_worker_after(job, committed_batches=2)
 
-        # The kill left the job 'processing' with two committed batches:
-        # 6 accounts and their 6 ledger rows (committed together in one
-        # transaction), while the skipped-ledger row for the invalid line
-        # at position 4 and the tail line at position 8 were in memory
-        # only and are gone.
+        # The kill left six valid payloads durably staged and the invalid
+        # line at position 4 terminal in the ledger. No Account was finalized
+        # before the worker died, and positions 7-8 remain unread.
         job.refresh_from_db()
         self.assertEqual(job.status, 'processing')
-        self.assertEqual(job.records.filter(status='committed').count(), 6)
-        self.assertEqual(Account.objects.count(), 6)
-        fingerprints_before = set(
-            Account.objects.values_list('fingerprint', flat=True)
+        self.assertEqual(job.records.filter(status='pending').count(), 6)
+        self.assertEqual(job.records.filter(status='skipped').count(), 1)
+        self.assertEqual(
+            ImportStageRecord.objects.filter(import_record__import_job=job).count(),
+            6,
         )
+        self.assertEqual(Account.objects.count(), 0)
+        fingerprints_before = set()
 
         # Time passes: the crashed worker's lease expires and discovery
         # finds the abandoned job.
@@ -811,7 +838,7 @@ class CrashRecoveryTests(TestCase):
         out = io.StringIO()
         call_command('recoverimports', '--run', stdout=out)
         self.assertIn('No recoverable import jobs.', out.getvalue())
-        self.assertEqual(Account.objects.count(), 6)
+        self.assertEqual(Account.objects.count(), 0)
 
         ImportJob.objects.filter(pk=job.pk).update(
             lease_expires_at=timezone.now() - timezone.timedelta(seconds=1)
@@ -819,7 +846,7 @@ class CrashRecoveryTests(TestCase):
         listing = io.StringIO()
         call_command('recoverimports', stdout=listing)
         self.assertIn(str(job.job_id), listing.getvalue())
-        self.assertEqual(Account.objects.count(), 6, 'listing must not import')
+        self.assertEqual(Account.objects.count(), 0, 'listing must not import')
 
         out = io.StringIO()
         call_command('recoverimports', '--run', stdout=out)
@@ -1213,7 +1240,7 @@ class ParallelFileImportTests(TransactionTestCase):
             output = io.StringIO()
             call_command(
                 'importfolder', directory, parallel_files=2, quiet=True,
-                stdout=output,
+                fast=True, stdout=output,
             )
 
         jobs = list(ImportJob.objects.order_by('source_path'))

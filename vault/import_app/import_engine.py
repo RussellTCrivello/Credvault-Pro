@@ -22,13 +22,17 @@ source manifest and does not claim to cover host/storage failures.
 import hashlib
 import logging
 import os
+from pathlib import Path
 import signal
 import threading
 import time
 import uuid
 from typing import NamedTuple
 
-from django.db import connection, models as dj_models, transaction
+from django.db import (
+    close_old_connections, connection, connections,
+    models as dj_models, transaction,
+)
 from django.utils import timezone
 
 from .import_metrics import ImportMetrics
@@ -42,7 +46,8 @@ from .importer import (
 )
 from ..models import (
     Account, Email, ImportJob, ImportRecord, ImportRecoveryLog,
-    Ip, Pass, Url, User, IMPORT_LEASE_SECONDS, record_fingerprint,
+    ImportStageRecord, Ip, Pass, Url, User, IMPORT_LEASE_SECONDS,
+    record_fingerprint,
 )
 from ..utils import (
     NO_IP, OversizedSourceLine,
@@ -326,6 +331,145 @@ def release_lease(job, worker_id=None):
         job.worker_id = ''
         job.lease_expires_at = None
     return bool(updated)
+
+
+class DeferredImportCompletion:
+    """Hold successful fast-mode jobs until suspended indexes are rebuilt.
+
+    Sessions keep their normal worker leases while the outer fast-import
+    context rebuilds search indexes. A small heartbeat renews all registered
+    leases; after index validation, the barrier marks each job complete.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._jobs = {}
+        self._lease_lost = set()
+        self._thread = None
+        self._finished = False
+        self._heartbeat_interval = max(
+            1.0, min(15.0, IMPORT_LEASE_SECONDS / 3.0),
+        )
+
+    def register(self, job, worker_id):
+        """Register a fully imported job; leave its lease live for the barrier."""
+        with self._lock:
+            if self._finished:
+                raise RuntimeError('Import completion barrier is already closed.')
+            self._jobs[job.pk] = (job, worker_id)
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._heartbeat,
+                    name='credvault-import-completion-heartbeat',
+                    daemon=True,
+                )
+                self._thread.start()
+
+    def _heartbeat(self):
+        while not self._stop.wait(self._heartbeat_interval):
+            with self._lock:
+                jobs = list(self._jobs.items())
+            close_old_connections()
+            try:
+                for job_pk, (_job, worker_id) in jobs:
+                    try:
+                        current = ImportJob.objects.only('pk').get(pk=job_pk)
+                        if not renew_lease(current, worker_id):
+                            with self._lock:
+                                self._lease_lost.add(job_pk)
+                    except Exception:
+                        # A transient DB error gets another heartbeat attempt;
+                        # never expose SQL/driver details in the import log.
+                        continue
+            finally:
+                connections.close_all()
+
+    def _stop_heartbeat(self):
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(2.0, self._heartbeat_interval + 1.0))
+
+    def complete(self):
+        """Complete successful jobs only after index rebuild has succeeded."""
+        self._stop_heartbeat()
+        with self._lock:
+            jobs = list(self._jobs.items())
+            lost = set(self._lease_lost)
+            self._finished = True
+        all_finalized = True
+        for job_pk, (job, worker_id) in jobs:
+            try:
+                job.refresh_from_db()
+                if job.status == 'cancelled':
+                    # Cancellation remains terminal. Its accepted payloads
+                    # were already drained by the session before registration.
+                    release_lease(job, worker_id)
+                    continue
+                if (
+                    job_pk in lost
+                    or job.worker_id != worker_id
+                    or job.lease_expires_at is None
+                    or job.lease_expires_at <= timezone.now()
+                ):
+                    release_lease(job, worker_id)
+                    all_finalized = False
+                    continue
+                job.refresh_counters()
+                pending = job.records.filter(
+                    status__in=('pending', 'processing'),
+                ).exists()
+                staged = ImportStageRecord.objects.filter(
+                    import_record__import_job_id=job.pk,
+                ).exists()
+                if (
+                    pending or staged
+                    or job.total_attempted < job.total_discovered
+                ):
+                    job.mark_failed(
+                        'Import could not be completed after search-index rebuild.',
+                        worker_id=worker_id,
+                    )
+                    all_finalized = False
+                elif not job.mark_completed(
+                    has_errors=job.total_failed > 0,
+                    worker_id=worker_id,
+                ):
+                    job.refresh_from_db(fields=['status'])
+                    if job.status != 'cancelled':
+                        all_finalized = False
+                release_lease(job, worker_id)
+            except Exception:
+                # Keep the user-visible failure generic; database exceptions
+                # may contain SQL parameters or imported values.
+                all_finalized = False
+                try:
+                    job.mark_failed(
+                        'Import completion failed after index maintenance.',
+                        worker_id=worker_id,
+                    )
+                    release_lease(job, worker_id)
+                except Exception:
+                    pass
+        return all_finalized
+
+    def fail(self):
+        """Fail deferred jobs if the index rebuild/validation itself fails."""
+        self._stop_heartbeat()
+        with self._lock:
+            jobs = list(self._jobs.values())
+            self._finished = True
+        for job, worker_id in jobs:
+            try:
+                job.refresh_from_db()
+                job.mark_failed(
+                    'Search-index rebuild failed; import completion was withheld.',
+                    worker_id=worker_id,
+                )
+                release_lease(job, worker_id)
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -806,6 +950,525 @@ _LEDGER_INSERT = (
     " error_message, error_category, retryable, processed_at"
     " FROM vault_import_ledger_stage"
 )
+
+_IMPORT_FINALIZER_SIGNATURE = 'vault_finalize_import_batch(bigint,text,integer,integer)'
+_IMPORT_FINALIZER_VERSION = 'credvault-import-finalizer-v3'
+_IMPORT_FINALIZER_INSTALL_LOCK = threading.Lock()
+
+_BULK_INGEST_STAGE_DDL = """
+CREATE TEMP TABLE IF NOT EXISTS vault_import_ingest_stage (
+    idempotency_key text PRIMARY KEY,
+    source_position bigint NOT NULL,
+    source_hash text NOT NULL,
+    outcome_status text NOT NULL,
+    is_valid boolean NOT NULL,
+    url text,
+    account_type text,
+    ident text,
+    secret text,
+    ip text,
+    error_message text NOT NULL,
+    error_category text NOT NULL,
+    retryable boolean NOT NULL,
+    existing_record_id bigint,
+    prior_status text,
+    prior_retryable boolean,
+    process_row boolean NOT NULL DEFAULT false
+) ON COMMIT DROP
+"""
+
+_CHECKPOINT_ADVANCE_SQL = """
+WITH RECURSIVE terminal_prefix AS (
+    SELECT r.source_position, r.status
+    FROM vault_importrecord AS r
+    WHERE r.import_job_id = %s AND r.source_position = %s
+    UNION ALL
+    SELECT r.source_position, r.status
+    FROM terminal_prefix AS p
+    JOIN vault_importrecord AS r
+      ON r.import_job_id = %s
+     AND r.source_position = p.source_position + 1
+    WHERE p.status IN ('committed', 'skipped', 'failed')
+)
+SELECT COALESCE(
+    MAX(source_position) FILTER (
+        WHERE status IN ('committed', 'skipped', 'failed')
+    ),
+    %s
+)
+FROM terminal_prefix
+"""
+
+
+def ensure_import_finalizer_installed(force=False):
+    """Install once safely across concurrent workers and database processes."""
+    if connection.vendor != 'postgresql':
+        raise RuntimeError('The durable bulk finalizer requires PostgreSQL.')
+    with _IMPORT_FINALIZER_INSTALL_LOCK:
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (_IMPORT_FINALIZER_VERSION,),
+                )
+            return _ensure_import_finalizer_installed_locked(force=force)
+
+
+def _ensure_import_finalizer_installed_locked(force=False):
+    """Install and permission the versioned PostgreSQL set-based finalizer."""
+    if connection.vendor != 'postgresql':
+        raise RuntimeError('The durable bulk finalizer requires PostgreSQL.')
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT to_regclass(%s)::oid', ('vault_import_stage_record',))
+        if cursor.fetchone()[0] is None:
+            raise RuntimeError(
+                'Import staging schema is missing; run '
+                '`python manage.py migrate --run-syncdb` first.'
+            )
+        cursor.execute('SELECT to_regprocedure(%s)::oid', (_IMPORT_FINALIZER_SIGNATURE,))
+        function_oid = cursor.fetchone()[0]
+        installed_version = None
+        if function_oid is not None:
+            cursor.execute(
+                "SELECT obj_description(%s::oid, 'pg_proc')", (function_oid,),
+            )
+            installed_version = cursor.fetchone()[0]
+            if installed_version != _IMPORT_FINALIZER_VERSION and not force:
+                raise RuntimeError(
+                    'The PostgreSQL import finalizer is outdated; run '
+                    '`python manage.py install_import_pipeline` as the '
+                    'database schema owner.'
+                )
+            if installed_version == _IMPORT_FINALIZER_VERSION and not force:
+                return False
+
+        sql_path = Path(__file__).with_name('import_finalize.sql')
+        cursor.execute(sql_path.read_text(encoding='utf-8'))
+        cursor.execute(
+            'COMMENT ON FUNCTION ' + _IMPORT_FINALIZER_SIGNATURE
+            + ' IS %s', (_IMPORT_FINALIZER_VERSION,),
+        )
+        cursor.execute(
+            'REVOKE ALL ON FUNCTION ' + _IMPORT_FINALIZER_SIGNATURE
+            + ' FROM PUBLIC'
+        )
+        cursor.execute('REVOKE ALL ON TABLE vault_import_stage_record FROM PUBLIC')
+        app_role = connection.settings_dict.get('USER')
+        if app_role:
+            quoted_role = connection.ops.quote_name(app_role)
+            cursor.execute(
+                'GRANT EXECUTE ON FUNCTION ' + _IMPORT_FINALIZER_SIGNATURE
+                + f' TO {quoted_role}'
+            )
+            cursor.execute(
+                'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE '
+                f'vault_import_stage_record TO {quoted_role}'
+            )
+    return True
+
+
+def _advance_import_checkpoint(cursor, job_pk, checkpoint):
+    """Advance only through the contiguous prefix with terminal outcomes."""
+    cursor.execute(
+        _CHECKPOINT_ADVANCE_SQL,
+        (job_pk, checkpoint + 1, job_pk, checkpoint),
+    )
+    return int(cursor.fetchone()[0])
+
+
+def _durable_stage_batch(
+    rows, record_metas, job_pk, *, outcome_metas=None, worker_id=None,
+    direct_copy=False,
+):
+    """COPY canonical payloads and ledger states into a durable private stage."""
+    worker_id = worker_id or getattr(_lease_context, 'worker_id', None)
+    if len(rows) != len(record_metas):
+        raise ValueError('rows and record_metas must have the same length')
+    incoming = list(zip(rows, record_metas))
+    incoming.extend((None, meta) for meta in (outcome_metas or ()))
+    if not incoming:
+        return 0
+
+    # A caller may retry an identical PositionedLine in one batch. Collapse it
+    # before COPY, but reject a different payload for the same source position.
+    unique = {}
+    for row, meta in incoming:
+        key = meta['idempotency_key']
+        previous = unique.get(key)
+        if previous is not None:
+            if previous[1]['source_hash'] != meta['source_hash']:
+                raise SourceChangedError(
+                    'One source position produced conflicting line hashes.'
+                )
+            continue
+        unique[key] = (row, meta)
+
+    now = timezone.now()
+    expires = now + timezone.timedelta(seconds=IMPORT_LEASE_SECONDS)
+    with transaction.atomic():
+        with connection.cursor() as cursor:
+            cursor.execute('SET LOCAL synchronous_commit = on')
+            cursor.execute('SET LOCAL work_mem = %s', (import_work_mem(),))
+            job = ImportJob.objects.select_for_update().get(pk=job_pk)
+            if worker_id:
+                if (
+                    job.worker_id != worker_id
+                    or job.lease_expires_at is None
+                    or job.lease_expires_at <= now
+                    or job.status not in ('pending', 'processing', 'paused', 'cancelled')
+                ):
+                    raise LeaseLostError('Import worker no longer owns this job.')
+
+            positions = [
+                int(meta['source_position']) for _row, meta in unique.values()
+            ]
+            checkpoint_data = job.last_checkpoint or {}
+            staged_through = int(checkpoint_data.get('staged_through', 0) or 0)
+            is_contiguous_forward_batch = (
+                bool(positions)
+                and len(set(positions)) == len(positions)
+                and min(positions) == staged_through + 1
+                and max(positions) - min(positions) + 1 == len(positions)
+            )
+            if direct_copy and is_contiguous_forward_batch:
+                # A fresh, contiguous stream has no idempotency conflicts by
+                # construction. Allocate ledger IDs once, then COPY directly
+                # into both durable tables instead of round-tripping through
+                # the temp ingest table and joining it back to the ledger.
+                # Retries, recovery, and positioned/gapped input still use the
+                # conflict-aware set-based path below.
+                max_position = max(positions)
+                if job.source_hash and max_position > job.total_discovered:
+                    raise SourceChangedError(
+                        'Source line position exceeds the verified manifest.'
+                    )
+                cursor.execute(
+                    "SELECT nextval(pg_get_serial_sequence(%s, 'id')) "
+                    'FROM generate_series(1, %s)',
+                    ('public.vault_importrecord', len(unique)),
+                )
+                record_ids = [int(row[0]) for row in cursor.fetchall()]
+                now = timezone.now()
+                attempted_delta = 0
+                committed_delta = 0
+                skipped_delta = 0
+                failed_delta = 0
+                with cursor.copy(
+                    'COPY vault_importrecord ('
+                    'id, import_job_id, idempotency_key, source_position, '
+                    'source_hash, source_line, status, account_id, '
+                    'account_fingerprint, error_message, error_category, '
+                    'retryable, processed_at) FROM STDIN'
+                ) as copy_ctx:
+                    for record_id, (row, meta) in zip(
+                        record_ids, unique.values(),
+                    ):
+                        status = 'pending' if row is not None else meta.get(
+                            'status', 'failed',
+                        )
+                        if status in ('committed', 'skipped', 'failed'):
+                            attempted_delta += 1
+                            if status == 'committed':
+                                committed_delta += 1
+                            elif status == 'skipped':
+                                skipped_delta += 1
+                            else:
+                                failed_delta += 1
+                        copy_ctx.write_row((
+                            record_id,
+                            job_pk,
+                            meta['idempotency_key'],
+                            int(meta['source_position']),
+                            meta['source_hash'],
+                            '',
+                            status,
+                            None,
+                            '',
+                            '' if row is not None else meta.get(
+                                'error_message', '',
+                            ),
+                            '' if row is not None else meta.get(
+                                'error_category', '',
+                            ),
+                            False if row is not None else bool(
+                                meta.get('retryable', False),
+                            ),
+                            None if row is not None else now,
+                        ))
+                with cursor.copy(
+                    'COPY vault_import_stage_record ('
+                    'import_record_id, url, account_type, ident, secret, ip) '
+                    'FROM STDIN'
+                ) as copy_ctx:
+                    for record_id, (row, _meta) in zip(
+                        record_ids, unique.values(),
+                    ):
+                        if row is not None:
+                            copy_ctx.write_row((
+                                record_id, row[0], row[1], row[2], row[3],
+                                row[4],
+                            ))
+                checkpoint = int(
+                    (job.last_checkpoint or {}).get('accounted_through', 0),
+                )
+                accounted_through = _advance_import_checkpoint(
+                    cursor, job.pk, checkpoint,
+                )
+                expires = now + timezone.timedelta(
+                    seconds=IMPORT_LEASE_SECONDS,
+                )
+                cursor.execute("""
+                    UPDATE vault_importjob
+                       SET total_discovered = GREATEST(total_discovered, %s),
+                           total_attempted = GREATEST(0, total_attempted + %s),
+                           total_committed = GREATEST(0, total_committed + %s),
+                           total_skipped = GREATEST(0, total_skipped + %s),
+                           total_failed = GREATEST(0, total_failed + %s),
+                           last_checkpoint =
+                               (CASE WHEN jsonb_typeof(last_checkpoint) = 'object'
+                                     THEN last_checkpoint ELSE '{}'::jsonb END)
+                               || jsonb_build_object(
+                                   'accounted_through', %s,
+                                   'staged_through', GREATEST(
+                                       COALESCE(NULLIF(last_checkpoint ->> 'staged_through', '')::bigint, 0),
+                                       %s
+                                   ),
+                                   'updated_at', %s
+                               ),
+                           last_activity_at = %s,
+                           lease_expires_at = %s
+                     WHERE id = %s
+                """, (
+                    max_position, attempted_delta, committed_delta,
+                    skipped_delta, failed_delta, accounted_through,
+                    max_position, now, now, expires, job_pk,
+                ))
+                return len(unique)
+
+            cursor.execute(_BULK_INGEST_STAGE_DDL)
+            cursor.execute('TRUNCATE pg_temp.vault_import_ingest_stage')
+            with cursor.copy(
+                'COPY pg_temp.vault_import_ingest_stage ('
+                'idempotency_key, source_position, source_hash, outcome_status, '
+                'is_valid, url, account_type, ident, secret, ip, error_message, '
+                'error_category, retryable) FROM STDIN'
+            ) as copy_ctx:
+                for row, meta in unique.values():
+                    is_valid = row is not None
+                    copy_ctx.write_row((
+                        meta['idempotency_key'],
+                        int(meta['source_position']),
+                        meta['source_hash'],
+                        'pending' if is_valid else meta.get('status', 'failed'),
+                        is_valid,
+                        row[0] if is_valid else None,
+                        row[1] if is_valid else None,
+                        row[2] if is_valid else None,
+                        row[3] if is_valid else None,
+                        row[4] if is_valid else None,
+                        '' if is_valid else meta.get('error_message', ''),
+                        '' if is_valid else meta.get('error_category', ''),
+                        False if is_valid else bool(meta.get('retryable', False)),
+                    ))
+            cursor.execute('ANALYZE pg_temp.vault_import_ingest_stage')
+            cursor.execute("""
+                UPDATE pg_temp.vault_import_ingest_stage AS s
+                   SET existing_record_id = r.id,
+                       prior_status = r.status,
+                       prior_retryable = r.retryable
+                  FROM vault_importrecord AS r
+                 WHERE r.idempotency_key = s.idempotency_key
+            """)
+            cursor.execute("""
+                SELECT 1
+                  FROM pg_temp.vault_import_ingest_stage AS s
+                  JOIN vault_importrecord AS r
+                    ON r.id = s.existing_record_id
+                 WHERE r.source_hash IS DISTINCT FROM s.source_hash
+                 LIMIT 1
+            """)
+            if cursor.fetchone():
+                raise SourceChangedError(
+                    'Source content changed at an already-accounted position.'
+                )
+            cursor.execute("""
+                UPDATE pg_temp.vault_import_ingest_stage
+                   SET process_row = (
+                       existing_record_id IS NULL
+                       OR prior_status IN ('pending', 'processing')
+                       OR (prior_status = 'failed' AND prior_retryable)
+                   )
+            """)
+
+            # Insert new ledger identities via COPY-backed SELECT. Raw source
+            # lines are intentionally absent: only hashes/outcomes survive.
+            cursor.execute("""
+                INSERT INTO vault_importrecord (
+                    import_job_id, idempotency_key, source_position,
+                    source_hash, source_line, status, account_id,
+                    account_fingerprint, error_message, error_category,
+                    retryable, processed_at
+                )
+                SELECT %s, s.idempotency_key, s.source_position,
+                       s.source_hash, '',
+                       CASE WHEN s.is_valid THEN 'pending' ELSE s.outcome_status END,
+                       NULL, '',
+                       CASE WHEN s.is_valid THEN '' ELSE s.error_message END,
+                       CASE WHEN s.is_valid THEN '' ELSE s.error_category END,
+                       CASE WHEN s.is_valid THEN false ELSE s.retryable END,
+                       CASE WHEN s.is_valid THEN NULL ELSE %s END
+                  FROM pg_temp.vault_import_ingest_stage AS s
+                 WHERE s.existing_record_id IS NULL
+                ON CONFLICT (idempotency_key) DO NOTHING
+            """, (job_pk, now))
+            cursor.execute("""
+                UPDATE pg_temp.vault_import_ingest_stage AS s
+                   SET existing_record_id = r.id
+                  FROM vault_importrecord AS r
+                 WHERE s.existing_record_id IS NULL
+                   AND r.idempotency_key = s.idempotency_key
+            """)
+            cursor.execute("""
+                UPDATE vault_importrecord AS r
+                   SET status = s.outcome_status,
+                       account_id = NULL,
+                       account_fingerprint = '',
+                       error_message = s.error_message,
+                       error_category = s.error_category,
+                       retryable = s.retryable,
+                       processed_at = CASE WHEN s.is_valid THEN NULL ELSE %s END
+                  FROM pg_temp.vault_import_ingest_stage AS s
+                 WHERE r.id = s.existing_record_id
+                   AND s.process_row
+                   AND s.prior_status IS NOT NULL
+                   AND (
+                       r.status IN ('pending', 'processing')
+                       OR (r.status = 'failed' AND r.retryable)
+                   )
+                   AND NOT (
+                       s.is_valid AND s.prior_status = 'failed'
+                       AND s.prior_retryable
+                   )
+            """, (now,))
+            cursor.execute("""
+                INSERT INTO vault_import_stage_record (
+                    import_record_id, url, account_type, ident, secret, ip
+                )
+                SELECT r.id, s.url, s.account_type, s.ident, s.secret, s.ip
+                  FROM pg_temp.vault_import_ingest_stage AS s
+                  JOIN vault_importrecord AS r
+                    ON r.id = s.existing_record_id
+                 WHERE s.process_row AND s.is_valid
+                ON CONFLICT (import_record_id) DO UPDATE
+                    SET url = EXCLUDED.url,
+                        account_type = EXCLUDED.account_type,
+                        ident = EXCLUDED.ident,
+                        secret = EXCLUDED.secret,
+                        ip = EXCLUDED.ip
+            """)
+            cursor.execute("""
+                DELETE FROM vault_import_stage_record AS p
+                USING pg_temp.vault_import_ingest_stage AS s
+                WHERE p.import_record_id = s.existing_record_id
+                  AND (
+                      (s.process_row AND NOT s.is_valid)
+                      OR (NOT s.process_row AND s.prior_status IN ('committed', 'skipped', 'failed'))
+                  )
+            """)
+
+            cursor.execute("""
+                SELECT
+                    COALESCE(SUM(
+                        CASE WHEN target_status IN ('committed', 'skipped', 'failed') THEN 1 ELSE 0 END
+                        - CASE WHEN prior_status IN ('committed', 'skipped', 'failed') THEN 1 ELSE 0 END
+                    ), 0),
+                    COALESCE(SUM(
+                        CASE WHEN target_status = 'committed' THEN 1 ELSE 0 END
+                        - CASE WHEN prior_status = 'committed' THEN 1 ELSE 0 END
+                    ), 0),
+                    COALESCE(SUM(
+                        CASE WHEN target_status = 'skipped' THEN 1 ELSE 0 END
+                        - CASE WHEN prior_status = 'skipped' THEN 1 ELSE 0 END
+                    ), 0),
+                    COALESCE(SUM(
+                        CASE WHEN target_status = 'failed' THEN 1 ELSE 0 END
+                        - CASE WHEN prior_status = 'failed' THEN 1 ELSE 0 END
+                    ), 0),
+                    COALESCE(MAX(source_position), 0)
+                FROM (
+                    SELECT s.*,
+                           CASE
+                               WHEN is_valid AND prior_status = 'failed' AND prior_retryable
+                                   THEN prior_status
+                               WHEN is_valid THEN 'pending'
+                               ELSE outcome_status
+                           END AS target_status
+                      FROM pg_temp.vault_import_ingest_stage AS s
+                     WHERE process_row
+                ) AS processed
+            """)
+            attempted_delta, committed_delta, skipped_delta, failed_delta, staged_through = cursor.fetchone()
+            checkpoint = int((job.last_checkpoint or {}).get('accounted_through', 0))
+            accounted_through = _advance_import_checkpoint(cursor, job.pk, checkpoint)
+            cursor.execute("""
+                UPDATE vault_importjob
+                   SET total_attempted = GREATEST(0, total_attempted + %s),
+                       total_committed = GREATEST(0, total_committed + %s),
+                       total_skipped = GREATEST(0, total_skipped + %s),
+                       total_failed = GREATEST(0, total_failed + %s),
+                       last_checkpoint =
+                           (CASE WHEN jsonb_typeof(last_checkpoint) = 'object'
+                                 THEN last_checkpoint ELSE '{}'::jsonb END)
+                           || jsonb_build_object(
+                               'accounted_through', %s,
+                               'staged_through', GREATEST(
+                                   COALESCE(NULLIF(last_checkpoint ->> 'staged_through', '')::bigint, 0),
+                                   %s
+                               ),
+                               'updated_at', %s
+                           ),
+                       last_activity_at = %s,
+                       lease_expires_at = %s
+                 WHERE id = %s
+            """, (
+                attempted_delta, committed_delta, skipped_delta, failed_delta,
+                accounted_through, staged_through, now, now, expires, job_pk,
+            ))
+    return len(unique)
+
+
+def _durable_finalize_batch(job_pk, *, worker_id=None, batch_rows=100000):
+    """Run one bounded PostgreSQL set-based deduplication batch."""
+    worker_id = worker_id or getattr(_lease_context, 'worker_id', None)
+    with transaction.atomic():
+        with connection.cursor() as cursor:
+            cursor.execute('SET LOCAL synchronous_commit = on')
+            cursor.execute('SET LOCAL work_mem = %s', (import_work_mem(),))
+            cursor.execute(
+                'SELECT processed, committed, skipped, failed, accounted_through '
+                'FROM vault_finalize_import_batch(%s, %s, %s, %s)',
+                (job_pk, worker_id, int(batch_rows), IMPORT_LEASE_SECONDS),
+            )
+            processed, committed, skipped, failed, accounted_through = cursor.fetchone()
+    return {
+        'processed': int(processed),
+        'committed': int(committed),
+        'skipped': int(skipped),
+        'failed': int(failed),
+        'accounted_through': int(accounted_through),
+    }
+
+
+def _set_import_job_stage(job_pk, worker_id, stage):
+    """Update a worker-owned job stage while renewing its lease."""
+    now = timezone.now()
+    expires = now + timezone.timedelta(seconds=IMPORT_LEASE_SECONDS)
+    updated = ImportJob.objects.filter(
+        pk=job_pk, worker_id=worker_id, lease_expires_at__gt=now,
+        status__in=('processing', 'paused', 'cancelled'),
+    ).update(stage=stage, last_activity_at=now, lease_expires_at=expires)
+    if not updated:
+        raise LeaseLostError('Import worker no longer owns this job.')
 
 
 def _durable_flush_batch(
@@ -1669,7 +2332,8 @@ class DurableImportSession:
 
     def __init__(self, job, batch_rows=None, workers=None,
                  on_progress=None, cancel_check=None, worker_id=None,
-                 source_check=None, source_close=None):
+                 source_check=None, source_close=None, bulk_finalize=True,
+                 completion_barrier=None):
         self.job = job
         self._batch_rows = (
             stage_rows() if batch_rows is None
@@ -1683,6 +2347,8 @@ class DurableImportSession:
         self._cancel_check = cancel_check
         self._source_check = source_check
         self._source_close = source_close
+        self._bulk_finalize = bool(bulk_finalize)
+        self._completion_barrier = completion_barrier
         self._position = 0
         self._interrupted = False
         self._paused = False
@@ -1716,7 +2382,7 @@ class DurableImportSession:
     def _handle_signal(self, signum, frame):
         self._interrupted = True
 
-    def _should_stop(self, flush_batch=None):
+    def _should_stop(self, flush_batch=None, flush_finalization=None):
         """Poll durable control state and wait in place while paused."""
         if self._interrupted or self._cancelled:
             return True
@@ -1740,6 +2406,8 @@ class DurableImportSession:
             self._paused = True
             if flush_batch:
                 flush_batch()
+            if flush_finalization:
+                flush_finalization()
             renew_at = time.monotonic()
             while True:
                 if self._interrupted:
@@ -1843,6 +2511,8 @@ class DurableImportSession:
         }
 
         metrics = self.metrics = ImportMetrics(job.job_id)
+        completion_deferred = False
+        direct_stage_copy = False
 
         def flush_batch():
             nonlocal batch_valid_count, batch_outcome_count
@@ -1858,19 +2528,33 @@ class DurableImportSession:
                 source_check()
             batch_started = time.monotonic()
             try:
-                _durable_flush_batch(
-                    batch_rows, batch_metas, job.pk, seen=reference_seen,
-                )
+                if self._bulk_finalize:
+                    _durable_stage_batch(
+                        batch_rows, batch_metas, job.pk,
+                        worker_id=self._worker_id,
+                        direct_copy=direct_stage_copy,
+                    )
+                else:
+                    _durable_flush_batch(
+                        batch_rows, batch_metas, job.pk,
+                        worker_id=self._worker_id, seen=reference_seen,
+                    )
             except BaseException:
-                # The cache is filled inside the batch transaction. A rolled
-                # back batch must not leave values marked as stored, or a
-                # retry would skip inserting them and lose the accounts.
+                # The legacy reference cache is filled inside the flush
+                # transaction. A rollback must not make rows appear present.
                 _bound_reference_cache(reference_seen, 0)
                 raise
-            metrics.record_batch(
-                len(batch_metas), batch_valid_count,
-                time.monotonic() - batch_started, batch_buffer_bytes,
-            )
+            elapsed = time.monotonic() - batch_started
+            if self._bulk_finalize:
+                metrics.record_staging_batch(
+                    len(batch_metas), batch_valid_count,
+                    elapsed, batch_buffer_bytes,
+                )
+            else:
+                metrics.record_batch(
+                    len(batch_metas), batch_valid_count,
+                    elapsed, batch_buffer_bytes,
+                )
             _bound_reference_cache(reference_seen, MAX_REFERENCE_CACHE_VALUES)
             batch_rows.clear()
             batch_metas.clear()
@@ -1884,6 +2568,48 @@ class DurableImportSession:
                 # a commit. Refuse before the iterator yields another line.
                 if callable(source_check):
                     source_check()
+
+        def finalize_one_batch():
+            if not self._bulk_finalize or self._lease_lost:
+                return 0
+            started = time.monotonic()
+            result = _durable_finalize_batch(
+                job.pk,
+                worker_id=self._worker_id,
+                batch_rows=batch_limit,
+            )
+            processed = int(result['processed'])
+            metrics.record_finalization_batch(
+                processed, time.monotonic() - started,
+            )
+            return processed
+
+        def drain_staged_rows(check_controls=True):
+            """Finalize all durable payloads in bounded transactions."""
+            if not self._bulk_finalize:
+                return 0
+            finalized = 0
+            while not self._lease_lost:
+                processed = finalize_one_batch()
+                if processed <= 0:
+                    break
+                finalized += processed
+                if self._on_progress:
+                    # Staged payloads have already passed the manifest check
+                    # and are durable. Do not re-read or reject them because
+                    # the source changed after acceptance; the failure path
+                    # must still drain every accepted payload safely.
+                    self._on_progress(self._position)
+                if check_controls and not self._cancelled:
+                    if self._interrupted:
+                        break
+                    self._should_stop(
+                        flush_batch=flush_batch,
+                        flush_finalization=finalize_one_batch,
+                    )
+                    if self._lease_lost or self._interrupted:
+                        break
+            return finalized
 
         def append_batch_item(row, meta):
             nonlocal batch_valid_count, batch_outcome_count
@@ -1904,6 +2630,14 @@ class DurableImportSession:
                 flush_batch()
 
         try:
+            if self._bulk_finalize:
+                ensure_import_finalizer_installed()
+                direct_stage_copy = (
+                    not job.records.exists()
+                    and not ImportStageRecord.objects.filter(
+                        import_record__import_job_id=job.pk,
+                    ).exists()
+                )
             # ------------------------------------------------------------------
             # Parallel parsing path — same durable guarantees, but parsing
             # overlaps the database work. Used when worker_count() > 1
@@ -1966,7 +2700,10 @@ class DurableImportSession:
                     try:
                         for item in lines_iterable:
                             if control_poll_counter >= 2048:
-                                if self._should_stop(flush_batch=flush_batch):
+                                if self._should_stop(
+                                    flush_batch=flush_batch,
+                                    flush_finalization=finalize_one_batch,
+                                ):
                                     flush_batch()
                                     break
                                 control_poll_counter = 0
@@ -2014,14 +2751,20 @@ class DurableImportSession:
                         except Exception:
                             pass
 
-                    self._should_stop(flush_batch=flush_batch)
+                    self._should_stop(
+                                    flush_batch=flush_batch,
+                                    flush_finalization=finalize_one_batch,
+                                )
                     if not self._lease_lost:
                         flush_batch()
                 else:
                     # Pool creation failed — fall back to serial path.
                     for item in lines_iterable:
                         if control_poll_counter >= 2048:
-                            if self._should_stop(flush_batch=flush_batch):
+                            if self._should_stop(
+                                    flush_batch=flush_batch,
+                                    flush_finalization=finalize_one_batch,
+                                ):
                                 flush_batch()
                                 break
                             control_poll_counter = 0
@@ -2087,13 +2830,19 @@ class DurableImportSession:
                                     'Import worker no longer owns this job.'
                                 )
 
-                    self._should_stop(flush_batch=flush_batch)
+                    self._should_stop(
+                                    flush_batch=flush_batch,
+                                    flush_finalization=finalize_one_batch,
+                                )
                     if not self._lease_lost:
                         flush_batch()
             else:
                 for item in lines_iterable:
                     if control_poll_counter >= 2048:
-                        if self._should_stop(flush_batch=flush_batch):
+                        if self._should_stop(
+                                    flush_batch=flush_batch,
+                                    flush_finalization=finalize_one_batch,
+                                ):
                             flush_batch()
                             break
                         control_poll_counter = 0
@@ -2159,34 +2908,73 @@ class DurableImportSession:
                                 'Import worker no longer owns this job.'
                             )
 
-                self._should_stop(flush_batch=flush_batch)
+                self._should_stop(
+                                    flush_batch=flush_batch,
+                                    flush_finalization=finalize_one_batch,
+                                )
                 if not self._lease_lost:
                     flush_batch()
 
-            # Derive the final state after all complete transactions. A stop
-            # request takes effect at a batch boundary; unflushed lines are
-            # never claimed as processed.
+            # The staged payload is durable after the parsing batch commits.
+            # Cancellation drains accepted payloads; interruption deliberately
+            # leaves them recoverable and private in the stage table.
             if self._lease_lost:
                 return job
-            if self._cancelled:
-                job.mark_cancelled(worker_id=self._worker_id)
-            elif self._interrupted:
+            if self._interrupted:
                 job.mark_interrupted(worker_id=self._worker_id)
             elif self._paused:
                 job.mark_paused(worker_id=self._worker_id)
             else:
-                job.refresh_counters()
-                if job.total_attempted < job.total_discovered:
-                    job.mark_failed(
-                        'Source ended before every manifest position was accounted for.',
-                        worker_id=self._worker_id,
+                if self._cancelled:
+                    job.mark_cancelled(worker_id=self._worker_id)
+                if self._bulk_finalize:
+                    _set_import_job_stage(
+                        job.pk, self._worker_id, 'finalizing',
                     )
+                    drain_staged_rows(check_controls=not self._cancelled)
+                    if self._lease_lost:
+                        return job
+                    if self._cancelled:
+                        job.refresh_counters()
+                if self._interrupted:
+                    job.mark_interrupted(worker_id=self._worker_id)
+                elif self._paused:
+                    job.mark_paused(worker_id=self._worker_id)
+                elif self._cancelled:
+                    job.mark_cancelled(worker_id=self._worker_id)
                 else:
-                    job.mark_completed(
-                        has_errors=job.total_failed > 0,
-                        worker_id=self._worker_id,
+                    job.refresh_counters()
+                    pending_records = ImportRecord.objects.filter(
+                        import_job_id=job.pk,
+                        status__in=('pending', 'processing'),
+                    ).exists()
+                    staged_payloads = (
+                        ImportStageRecord.objects.filter(
+                            import_record__import_job_id=job.pk,
+                        ).exists()
+                        if self._bulk_finalize else False
                     )
-            release_lease(job, self._worker_id)
+                    if (
+                        pending_records or staged_payloads
+                        or job.total_attempted < job.total_discovered
+                    ):
+                        job.mark_failed(
+                            'Source ended before every manifest position was accounted for.',
+                            worker_id=self._worker_id,
+                        )
+                    else:
+                        if self._completion_barrier is not None:
+                            self._completion_barrier.register(
+                                job, self._worker_id,
+                            )
+                            completion_deferred = True
+                        else:
+                            job.mark_completed(
+                                has_errors=job.total_failed > 0,
+                                worker_id=self._worker_id,
+                            )
+            if not completion_deferred:
+                release_lease(job, self._worker_id)
 
         except LeaseLostError:
             # Another worker may already own the replacement lease. Do not
@@ -2201,6 +2989,19 @@ class DurableImportSession:
                 'Import source changed for job %s (%s: %s; cause %s).',
                 job.job_id, type(exc).__name__, exc, cause,
             )
+            if self._bulk_finalize and not self._lease_lost:
+                try:
+                    _set_import_job_stage(
+                        job.pk, self._worker_id, 'finalizing',
+                    )
+                    drain_staged_rows(check_controls=False)
+                except LeaseLostError:
+                    self._lease_lost = True
+                except Exception as finalize_exc:
+                    logger.warning(
+                        'Could not finalize staged rows for job %s (%s).',
+                        job.job_id, type(finalize_exc).__name__,
+                    )
             try:
                 job.mark_failed(
                     'Import source changed; resume refused.',
@@ -2212,10 +3013,27 @@ class DurableImportSession:
             # Exception messages and tracebacks can contain source values or
             # database parameters. Keep operational logs and the job record
             # free of imported credentials.
-            logger.error(
-                'Import job %s failed (%s).', job.job_id,
-                type(exc).__name__,
+            constraint = getattr(
+                getattr(getattr(exc, '__cause__', None), 'diag', None),
+                'constraint_name', '',
             )
+            logger.error(
+                'Import job %s failed (%s, constraint=%s).', job.job_id,
+                type(exc).__name__, constraint or '-',
+            )
+            if self._bulk_finalize and not self._lease_lost:
+                try:
+                    _set_import_job_stage(
+                        job.pk, self._worker_id, 'finalizing',
+                    )
+                    drain_staged_rows(check_controls=False)
+                except LeaseLostError:
+                    self._lease_lost = True
+                except Exception as finalize_exc:
+                    logger.warning(
+                        'Could not finalize staged rows for job %s (%s).',
+                        job.job_id, type(finalize_exc).__name__,
+                    )
             try:
                 job.mark_failed(
                     f'Import session failed ({type(exc).__name__}).',
@@ -2237,8 +3055,55 @@ class DurableImportSession:
 # Recovery
 # ---------------------------------------------------------------------------
 
+def _acquire_cancelled_finalization_lease(job, worker_id=None):
+    """Claim a cancelled job only to finalize already-accepted payloads."""
+    worker_id = worker_id or _current_worker_id()
+    now = timezone.now()
+    expires = now + timezone.timedelta(seconds=IMPORT_LEASE_SECONDS)
+    unowned_or_expired = (
+        dj_models.Q(worker_id='')
+        | dj_models.Q(worker_id__isnull=True)
+        | dj_models.Q(lease_expires_at__isnull=True)
+        | dj_models.Q(lease_expires_at__lte=now)
+    )
+    staged_payloads = ImportStageRecord.objects.filter(
+        import_record__import_job_id=dj_models.OuterRef('pk'),
+    )
+    updated = (
+        ImportJob.objects.filter(pk=job.pk, status='cancelled')
+        .annotate(_has_staged_payload=dj_models.Exists(staged_payloads))
+        .filter(_has_staged_payload=True)
+        .filter(unowned_or_expired)
+        .update(
+            worker_id=worker_id,
+            lease_expires_at=expires,
+            last_activity_at=now,
+        )
+    )
+    if updated:
+        job.worker_id = worker_id
+        job.lease_expires_at = expires
+        job.last_activity_at = now
+    return bool(updated)
+
+
+def _drain_recovery_staged_payloads(job, worker_id, batch_rows=None):
+    """Finalize durable stage rows without rereading an uploaded source."""
+    ensure_import_finalizer_installed()
+    _set_import_job_stage(job.pk, worker_id, 'finalizing')
+    batch_rows = max(1, int(batch_rows or stage_rows()))
+    finalized = 0
+    while True:
+        result = _durable_finalize_batch(
+            job.pk, worker_id=worker_id, batch_rows=batch_rows,
+        )
+        if result['processed'] <= 0:
+            return finalized
+        finalized += result['processed']
+
+
 def discover_interrupted_jobs():
-    """Find interrupted jobs and pending/processing jobs without a live owner."""
+    """Find abandoned jobs and cancelled jobs with pending private payloads."""
     now = timezone.now()
     unowned_or_expired = (
         dj_models.Q(worker_id='')
@@ -2246,15 +3111,22 @@ def discover_interrupted_jobs():
         | dj_models.Q(lease_expires_at__isnull=True)
         | dj_models.Q(lease_expires_at__lte=now)
     )
-    return ImportJob.objects.filter(
-        dj_models.Q(status='interrupted')
-        | (
-            dj_models.Q(status='pending')
-            & unowned_or_expired
+    staged_payloads = ImportStageRecord.objects.filter(
+        import_record__import_job_id=dj_models.OuterRef('pk'),
+    )
+    return (
+        ImportJob.objects.annotate(
+            _has_staged_payload=dj_models.Exists(staged_payloads),
         )
-        | (
-            dj_models.Q(status='processing')
-            & unowned_or_expired
+        .filter(
+            dj_models.Q(status='interrupted')
+            | (dj_models.Q(status='pending') & unowned_or_expired)
+            | (dj_models.Q(status='processing') & unowned_or_expired)
+            | (
+                dj_models.Q(status='cancelled')
+                & unowned_or_expired
+                & dj_models.Q(_has_staged_payload=True)
+            )
         )
     )
 
@@ -2291,10 +3163,35 @@ def recover_job(job, lines_iterable_factory=None):
             recovery_completed_at=recovery_started,
         )
 
-    terminal_job = current_status in ('completed', 'cancelled')
+    has_staged_payloads = ImportStageRecord.objects.filter(
+        import_record__import_job_id=job.pk,
+    ).exists()
+    cancelled_finalization = (
+        current_status == 'cancelled' and has_staged_payloads
+    )
+    terminal_job = (
+        current_status in ('completed', 'cancelled')
+        and not cancelled_finalization
+    )
     recovery_worker = _current_worker_id()
     owns_lease = False
-    if not terminal_job:
+    if cancelled_finalization:
+        owns_lease = _acquire_cancelled_finalization_lease(
+            job, recovery_worker,
+        )
+        if not owns_lease:
+            log.outcome = 'partial'
+            log.notes = (
+                'Cancelled-job cleanup was not started because a live lease '
+                'still owns the staged payloads.'
+            )
+            log.recovery_completed_at = timezone.now()
+            log.save(update_fields=[
+                'outcome', 'notes', 'recovery_completed_at',
+            ])
+            return log
+        _lease_context.worker_id = recovery_worker
+    elif not terminal_job:
         owns_lease = acquire_lease(job, recovery_worker)
         if not owns_lease:
             log.outcome = 'partial'
@@ -2384,7 +3281,52 @@ def recover_job(job, lines_iterable_factory=None):
                 ])
                 missing_count += 1
 
+        finalized_staged = 0
+        if has_staged_payloads:
+            finalized_staged = _drain_recovery_staged_payloads(
+                job, recovery_worker,
+            )
+            job.refresh_from_db()
         job.refresh_counters()
+
+        if cancelled_finalization:
+            remaining_staged = ImportStageRecord.objects.filter(
+                import_record__import_job_id=job.pk,
+            ).count()
+            pending_after_cleanup = job.records.filter(
+                status__in=('pending', 'processing'),
+            ).count()
+            log.records_committed = job.records.filter(
+                status='committed',
+            ).count()
+            log.records_pending = pending_after_cleanup
+            log.records_failed = job.records.filter(status='failed').count()
+            log.outcome = (
+                'success'
+                if remaining_staged == 0 and pending_after_cleanup == 0
+                else 'partial'
+            )
+            log.notes = (
+                f'Finalized {finalized_staged} accepted staged row(s) for the '
+                'cancelled job; cancellation remains terminal.'
+                if log.outcome == 'success'
+                else 'Cancelled-job cleanup left staged or unresolved rows; '
+                     'the job remains cancelled for manual review.'
+            )
+            log.reconciliation_details = {
+                **(log.reconciliation_details or {}),
+                'staged_finalized': finalized_staged,
+                'staged_remaining': remaining_staged,
+                'pending_after_cleanup': pending_after_cleanup,
+                'final_attempted': job.total_attempted,
+                'final_committed': job.total_committed,
+                'final_skipped': job.total_skipped,
+                'final_failed': job.total_failed,
+            }
+            log.recovery_completed_at = timezone.now()
+            log.save()
+            return log
+
         pending_count = job.records.filter(
             status__in=('pending', 'processing'),
         ).count()
@@ -2406,6 +3348,7 @@ def recover_job(job, lines_iterable_factory=None):
             'total_ledger_records': total_records,
             'manifest_lines': job.total_discovered,
             'retryable_failed': retryable_failed,
+            'staged_finalized': finalized_staged,
         }
         log.save(update_fields=[
             'records_committed', 'records_pending', 'records_failed',
@@ -2835,7 +3778,8 @@ def verify_import_job(job):
 
 def durable_import_file(filepath, job=None, on_progress=None,
                         cancel_check=None, batch_rows=None,
-                        on_job_created=None):
+                        on_job_created=None, bulk_finalize=True,
+                        completion_barrier=None):
     """Import one path-backed file after pinning and verifying its manifest."""
     filepath = os.path.abspath(filepath)
     expected_signatures = {}
@@ -2885,6 +3829,8 @@ def durable_import_file(filepath, job=None, on_progress=None,
         batch_rows=batch_rows,
         on_progress=on_progress,
         cancel_check=cancel_check,
+        bulk_finalize=bulk_finalize,
+        completion_barrier=completion_barrier,
     )
     session.run(line_iterator)
     return job
@@ -2937,7 +3883,8 @@ def _uploaded_manifest(uploaded_files, on_file_scanned=None):
 def durable_import_uploads(uploaded_files, source_name=None, on_progress=None,
                             cancel_check=None, batch_rows=None,
                             expected_line_count=None, on_job_created=None,
-                            prepared_manifest=None):
+                            prepared_manifest=None, bulk_finalize=True,
+                            completion_barrier=None):
     """Import uploaded streams durably; bytes are not retained for recovery."""
     uploaded_files = list(uploaded_files)
     if not uploaded_files:
@@ -3034,6 +3981,8 @@ def durable_import_uploads(uploaded_files, source_name=None, on_progress=None,
         batch_rows=batch_rows,
         on_progress=on_progress,
         cancel_check=cancel_check,
+        bulk_finalize=bulk_finalize,
+        completion_barrier=completion_barrier,
     )
     session.run(all_lines())
     return job
@@ -3041,7 +3990,8 @@ def durable_import_uploads(uploaded_files, source_name=None, on_progress=None,
 def durable_import_path(target_path, ext='*', on_progress=None,
                         cancel_check=None, batch_rows=None,
                         expected_line_count=None, on_job_created=None,
-                        prepared_manifest=None, workers=None):
+                        prepared_manifest=None, workers=None,
+                        bulk_finalize=True, completion_barrier=None):
     """Import all matching files using one immutable path manifest/job."""
     target_path = os.path.abspath(target_path)
     if prepared_manifest is None:
@@ -3097,6 +4047,8 @@ def durable_import_path(target_path, ext='*', on_progress=None,
         workers=workers,
         on_progress=on_progress,
         cancel_check=cancel_check,
+        bulk_finalize=bulk_finalize,
+        completion_barrier=completion_barrier,
     )
     session.run(line_iterator)
     return job

@@ -769,6 +769,16 @@ class ImportJob(models.Model):
         ])
 
     @property
+    def total_staged(self):
+        """Valid source rows durably queued for set-based finalization."""
+        staged = getattr(self, '_total_staged_count', None)
+        if staged is None and self.pk:
+            staged = ImportStageRecord.objects.filter(
+                import_record__import_job_id=self.pk,
+            ).count()
+        return int(staged or 0)
+
+    @property
     def remaining_count(self):
         """Source lines not yet durably assigned a terminal outcome."""
         return max(0, self.total_discovered - self.total_attempted)
@@ -833,7 +843,13 @@ class ImportJob(models.Model):
 
     @property
     def progress_percent(self):
-        """Percent of manifest lines with a durable terminal ledger outcome."""
+        """Percent of lines durably staged or assigned a terminal outcome.
+
+        Valid credentials remain in the restricted staging table until the
+        set-based finalizer reconciles them into Accounts and terminal ledger
+        states. Counting those durable staged rows keeps progress responsive
+        without pretending that they are already committed.
+        """
         if not self.total_discovered:
             return 100.0 if self.status in (
                 'completed', 'completed_with_errors',
@@ -845,9 +861,15 @@ class ImportJob(models.Model):
             attempted = (
                 self.total_committed + self.total_skipped + self.total_failed
             )
+        staged = getattr(self, '_progress_staged_count', None)
+        if staged is None and self.pk:
+            staged = ImportStageRecord.objects.filter(
+                import_record__import_job_id=self.pk,
+                import_record__status__in=('pending', 'processing'),
+            ).count()
         return min(
             100.0,
-            (attempted / self.total_discovered) * 100,
+            ((attempted + (staged or 0)) / self.total_discovered) * 100,
         )
 
 
@@ -965,6 +987,42 @@ class ImportRecord(models.Model):
         """Deterministic idempotency key for a source record."""
         payload = f"{job_id}:{source_position}"
         return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:64]
+
+
+class ImportStageRecord(models.Model):
+    """Private, crash-recoverable payload for a pending valid ledger row.
+
+    The staged canonical fields are deliberately not registered with Django
+    admin and receive no model permissions. They contain credentials, so they
+    are deleted in the same transaction that finalizes the corresponding
+    ImportRecord. A one-to-one primary key prevents duplicate payloads for a
+    source line and cascades cleanup when the ledger row is removed.
+    """
+
+    import_record = models.OneToOneField(
+        ImportRecord,
+        primary_key=True,
+        on_delete=models.CASCADE,
+        related_name='staged_payload',
+        db_column='import_record_id',
+    )
+    url = models.CharField(max_length=MAX_URL_LENGTH)
+    account_type = models.CharField(max_length=10)
+    ident = models.CharField(
+        max_length=max(MAX_EMAIL_LENGTH, MAX_USERNAME_LENGTH),
+    )
+    secret = models.CharField(max_length=MAX_PASSWORD_LENGTH)
+    ip = models.CharField(max_length=MAX_IP_LENGTH, null=True, blank=True)
+
+    class Meta:
+        db_table = 'vault_import_stage_record'
+        default_permissions = ()
+        verbose_name = _('Pending import payload')
+        verbose_name_plural = _('Pending import payloads')
+
+    def __str__(self):
+        # Never stringify a credential-bearing value.
+        return f'Pending import payload record={self.import_record_id}'
 
 
 class ImportRecoveryLog(models.Model):

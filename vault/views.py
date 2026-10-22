@@ -31,7 +31,7 @@ from .forms import (
 from .import_app.importer import (
     STREAM_BATCH_SIZE, collect_files_from_path, search_indexes_suspended,
 )
-from .models import Account, Email, Ip, Pass, Url, User
+from .models import Account, Email, ImportStageRecord, Ip, Pass, Url, User
 from .utils import extract_domain
 
 
@@ -992,7 +992,9 @@ def import_from_file(request):
     its own contract: the final NDJSON 'done' event carries the redirect
     to /records/ for the browser.
     """
-    from .import_app.import_engine import durable_import_path, durable_import_uploads
+    from .import_app.import_engine import (
+        DeferredImportCompletion, durable_import_path, durable_import_uploads,
+    )
     
     if request.method == 'POST':
         progress_request = request.headers.get('X-Import-Progress') == '1'
@@ -1039,11 +1041,20 @@ def import_from_file(request):
 
             # Use the durable import engine for non-streaming imports
             jobs = []
+            completion_barrier = (
+                DeferredImportCompletion() if fast_mode else None
+            )
             
-            with (search_indexes_suspended() if fast_mode else nullcontext()):
+            with (
+                search_indexes_suspended(
+                    completion_barrier=completion_barrier,
+                ) if fast_mode else nullcontext()
+            ):
                 # Import from paths
                 for path in paths:
-                    job = durable_import_path(path, ext="*")
+                    job = durable_import_path(
+                        path, ext="*", completion_barrier=completion_barrier,
+                    )
                     jobs.append(job)
 
                 if not files and not jobs:
@@ -1059,7 +1070,9 @@ def import_from_file(request):
                 # idempotency keys would collide and the ledger rows of
                 # every file after the first would be silently dropped.
                 if files:
-                    job = durable_import_uploads(files)
+                    job = durable_import_uploads(
+                        files, completion_barrier=completion_barrier,
+                    )
                     jobs.append(job)
 
             # Aggregate results from all jobs
@@ -1204,6 +1217,7 @@ def _stream_import_progress(uploaded_files, paths, fast_mode=False):
                 close_old_connections()
             try:
                 from .import_app.import_engine import (
+                    DeferredImportCompletion,
                     _source_manifest, _uploaded_manifest,
                     durable_import_path, durable_import_uploads,
                 )
@@ -1253,10 +1267,15 @@ def _stream_import_progress(uploaded_files, paths, fast_mode=False):
                     'total': total_lines,
                 })
 
-                context = (
-                    search_indexes_suspended()
-                    if fast_mode else nullcontext()
+                completion_barrier = (
+                    DeferredImportCompletion() if fast_mode else None
                 )
+                context = (
+                    search_indexes_suspended(
+                        completion_barrier=completion_barrier,
+                    ) if fast_mode else nullcontext()
+                )
+                completed_import_jobs = []
                 processed_before = 0
                 completed_files = 0
                 with context:
@@ -1292,14 +1311,12 @@ def _stream_import_progress(uploaded_files, paths, fast_mode=False):
                             batch_rows=STREAM_BATCH_SIZE,
                             expected_line_count=group_total,
                             prepared_manifest=prepared_manifest,
+                            completion_barrier=completion_barrier,
                         )
+                        completed_import_jobs.append(job)
                         result['created'] += job.total_committed
                         result['skipped'] += job.total_skipped
                         result['failed'] += job.total_failed
-                        if job.status not in (
-                            'completed', 'completed_with_errors',
-                        ):
-                            worker_error.append('ImportIncomplete')
                         processed_before += group_total
                         completed_files += len(group_files)
                         emit({
@@ -1337,14 +1354,12 @@ def _stream_import_progress(uploaded_files, paths, fast_mode=False):
                             batch_rows=STREAM_BATCH_SIZE,
                             expected_line_count=upload_line_count,
                             prepared_manifest=upload_manifest,
+                            completion_barrier=completion_barrier,
                         )
+                        completed_import_jobs.append(job)
                         result['created'] += job.total_committed
                         result['skipped'] += job.total_skipped
                         result['failed'] += job.total_failed
-                        if job.status not in (
-                            'completed', 'completed_with_errors',
-                        ):
-                            worker_error.append('ImportIncomplete')
                         processed_before += upload_line_count
                         completed_files += len(uploaded_files)
                         emit({
@@ -1355,6 +1370,12 @@ def _stream_import_progress(uploaded_files, paths, fast_mode=False):
                             'files_completed': completed_files,
                             'total_files': total_files,
                         })
+                for imported_job in completed_import_jobs:
+                    imported_job.refresh_from_db(fields=['status'])
+                    if imported_job.status not in (
+                        'completed', 'completed_with_errors',
+                    ):
+                        worker_error.append('ImportIncomplete')
             except Exception as exc:
                 # Do not include exception text: a parser/driver may include
                 # the raw credential line or SQL parameters in that message.
@@ -1547,6 +1568,18 @@ def export_json(request):
 
 def _import_job_status_payload(job):
     """JSON-safe, credential-free progress and lifecycle information."""
+    staged_counts = ImportStageRecord.objects.filter(
+        import_record__import_job_id=job.pk,
+    ).aggregate(
+        total=Count('pk'),
+        progress=Count(
+            'pk',
+            filter=Q(import_record__status__in=('pending', 'processing')),
+        ),
+    )
+    staged_count = staged_counts['total'] or 0
+    job._total_staged_count = staged_count
+    job._progress_staged_count = staged_counts['progress'] or 0
     return {
         'job_id': str(job.job_id),
         'status': job.status,
@@ -1555,6 +1588,7 @@ def _import_job_status_payload(job):
         'stage_display': str(job.get_stage_display()),
         'progress_percent': float(job.progress_percent),
         'total_discovered': int(job.total_discovered),
+        'total_staged': int(staged_count),
         'total_attempted': int(job.total_attempted),
         'total_committed': int(job.total_committed),
         'total_skipped': int(job.total_skipped),
@@ -1613,7 +1647,15 @@ def import_job_list(request):
     from .models import ImportJob
 
     page_obj = _paginate(
-        request, ImportJob.objects.order_by('-created_at'), per_page=100,
+        request,
+        ImportJob.objects.annotate(
+            _total_staged_count=Count('records__staged_payload'),
+            _progress_staged_count=Count(
+                'records__staged_payload',
+                filter=Q(records__status__in=('pending', 'processing')),
+            ),
+        ).order_by('-created_at'),
+        per_page=100,
     )
     return render(request, 'import/import_jobs.html', {
         'jobs': page_obj.object_list,
@@ -1627,6 +1669,17 @@ def import_job_detail(request, job_id):
     from .models import ImportJob
 
     job = get_object_or_404(ImportJob, job_id=job_id)
+    staged_counts = ImportStageRecord.objects.filter(
+        import_record__import_job_id=job.pk,
+    ).aggregate(
+        total=Count('pk'),
+        progress=Count(
+            'pk',
+            filter=Q(import_record__status__in=('pending', 'processing')),
+        ),
+    )
+    job._total_staged_count = staged_counts['total'] or 0
+    job._progress_staged_count = staged_counts['progress'] or 0
     recent_failures = job.records.filter(status='failed').order_by('-processed_at')[:20]
 
     return render(request, 'import/import_job_detail.html', {

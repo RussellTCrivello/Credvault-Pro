@@ -56,6 +56,11 @@ class ImportMetrics:
         self.batches = 0
         self.items = 0
         self.valid_rows = 0
+        self.staging_batches = 0
+        self.staging_seconds = 0.0
+        self.finalization_batches = 0
+        self.finalized_items = 0
+        self.finalization_seconds = 0.0
         self.db_seconds = 0.0
         self.max_batch_seconds = 0.0
         self.batch_bytes = 0
@@ -71,6 +76,29 @@ class ImportMetrics:
             self.valid_rows += int(valid_rows)
             self.db_seconds += db_seconds
             self.batch_bytes += int(batch_bytes)
+            self.max_batch_seconds = max(self.max_batch_seconds, db_seconds)
+            self._recent.append(db_seconds)
+            if len(self._recent) > _LATENCY_SAMPLES:
+                del self._recent[0]
+        self._maybe_log()
+
+    def record_staging_batch(self, items, valid_rows, db_seconds, batch_bytes=0):
+        """Record a COPY-to-durable-stage transaction."""
+        self.record_batch(items, valid_rows, db_seconds, batch_bytes)
+        with self._lock:
+            self.staging_batches += 1
+            self.staging_seconds += db_seconds
+
+    def record_finalization_batch(self, items, db_seconds):
+        """Record a PL/pgSQL set-based reconciliation transaction."""
+        # Finalization is a second DB phase, not a new source batch. Keep the
+        # historical ``batches`` / ``items`` counters source-scoped while
+        # retaining all DB time and a combined latency sample.
+        with self._lock:
+            self.finalization_batches += 1
+            self.finalized_items += int(items)
+            self.finalization_seconds += db_seconds
+            self.db_seconds += db_seconds
             self.max_batch_seconds = max(self.max_batch_seconds, db_seconds)
             self._recent.append(db_seconds)
             if len(self._recent) > _LATENCY_SAMPLES:
@@ -96,6 +124,11 @@ class ImportMetrics:
                 'items': self.items,
                 'valid_rows': self.valid_rows,
                 'items_per_second': round(self.items / elapsed, 1),
+                'staging_batches': self.staging_batches,
+                'staging_seconds': round(self.staging_seconds, 3),
+                'finalization_batches': self.finalization_batches,
+                'finalized_items': self.finalized_items,
+                'finalization_seconds': round(self.finalization_seconds, 3),
                 'db_seconds': round(self.db_seconds, 3),
                 # Share of wall time spent inside batch transactions. Near 1
                 # means the database is the bottleneck; low values mean the

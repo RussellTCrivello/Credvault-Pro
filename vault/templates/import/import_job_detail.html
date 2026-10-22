@@ -54,6 +54,10 @@
         <div data-job-counter="attempted">{{ job.total_attempted }}</div>
       </div>
       <div class="detail-item">
+        <label>{% trans "Pending finalization" %}</label>
+        <div data-job-counter="staged">{{ job.total_staged }}</div>
+      </div>
+      <div class="detail-item">
         <label>{% trans "Committed" %}</label>
         <div class="success-text" data-job-counter="committed">{{ job.total_committed }}</div>
       </div>

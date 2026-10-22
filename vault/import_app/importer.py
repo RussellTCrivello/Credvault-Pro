@@ -734,13 +734,12 @@ def bulk_import_lines(parsed_iter):
 # `vault_account` also cost a large fraction of the per-batch time for
 # an 18M-line file (measured: ~7s per 100k for references alone).
 #
-# Fast mode drops *all* non-unique search indexes for the duration and
-# rebuilds them once at the end. Unique constraints (`name` and
-# `fingerprint`) and primary keys stay in place, so deduplication and
-# referential integrity are unaffected. Exact searches still work (via
-# sequential scan) while the indexes are suspended; substring searches
-# are slower until rebuild — same policy as before, just extended to
-# all non-essential indexes for the 18M target.
+# Fast mode suspends a configured subset of non-unique search indexes and
+# rebuilds them once at the end. Unique constraints (`name` and `fingerprint`)
+# and primary keys always stay in place; job-scoped ledger position/status
+# indexes also remain online for bounded staged finalization and recovery.
+# Exact searches still work (via sequential scan) while eligible indexes are
+# suspended; substring searches are slower until rebuild.
 #
 # The rebuild uses `maintenance_work_mem` for speed and is crash-safe:
 # `ensure_search_indexes` is idempotent (IF NOT EXISTS) and is called
@@ -811,9 +810,10 @@ _FAST_MODE_INDEXES = (
     ("vault_acct_created_id_idx",
      "CREATE INDEX vault_acct_created_id_idx ON public.vault_account USING btree (created_at DESC, id)"),
 
-    # ledger table: non-unique indexes (FKs, status, job_pos, etc.)
-    # Dropping these during fast import cuts ledger INSERT cost.
-    # Unique indexes (pkey, idempotency_key_key) stay.
+    # ledger table: the account FK index can be suspended. The job/status
+    # and job/position indexes remain online in ``all`` scope because staged
+    # finalization, checkpoint advancement and recovery depend on them.
+    # Unique indexes (pkey, idempotency_key_key) are never dropped.
     ("vault_importrec_job_pos_idx",
      "CREATE INDEX vault_importrec_job_pos_idx ON public.vault_importrecord USING btree (import_job_id, source_position)"),
     ("vault_importrec_job_status_idx",
@@ -840,9 +840,10 @@ def fast_mode_scope():
     ``search`` suspends only the five ``pg_trgm`` substring indexes -- what
     the documentation always promised -- so exact searches, record lookups
     and every foreign-key path stay indexed while the import runs.
-    ``all`` (``VAULT_FAST_MODE_SCOPE=all``) additionally drops the btree
-    indexes on the reference, account and ledger tables; it is meant for an
-    offline load because lookups degrade badly meanwhile (README, "Fast mode").
+    ``all`` (``VAULT_FAST_MODE_SCOPE=all``) additionally drops most btree
+    indexes on the reference, account and ledger tables for an offline load.
+    The job-scoped ledger position/status indexes stay online because staged
+    finalization and recovery rely on them to bound reconciliation queries.
     """
     value = os.environ.get("VAULT_FAST_MODE_SCOPE", "search").strip().lower()
     return value if value in FAST_MODE_SCOPES else "search"
@@ -850,7 +851,14 @@ def fast_mode_scope():
 
 def _suspended_indexes(scope):
     if scope == "all":
-        return _FAST_MODE_INDEXES
+        required_for_finalization = {
+            "vault_importrec_job_pos_idx",
+            "vault_importrec_job_status_idx",
+        }
+        return tuple(
+            item for item in _FAST_MODE_INDEXES
+            if item[0] not in required_for_finalization
+        )
     return tuple(item for item in _FAST_MODE_INDEXES
                  if item[0].endswith("_trgm"))
 
@@ -933,11 +941,38 @@ def ensure_search_indexes():
                 continue
 
 
+def validate_search_indexes():
+    """Raise if any required non-unique fast-mode index is still absent."""
+    expected = [name for name, _ddl in _FAST_MODE_INDEXES]
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            SELECT wanted.index_name
+              FROM unnest(%s::text[]) AS wanted(index_name)
+             WHERE NOT EXISTS (
+                   SELECT 1
+                     FROM pg_class AS index_class
+                     JOIN pg_namespace AS index_schema
+                       ON index_schema.oid = index_class.relnamespace
+                    WHERE index_class.relname = wanted.index_name
+                      AND index_class.relkind = 'i'
+                      AND index_schema.nspname = 'public'
+             )
+             ORDER BY wanted.index_name
+        """, (expected,))
+        missing = [row[0] for row in cursor.fetchall()]
+    if missing:
+        raise RuntimeError(
+            'Required search indexes are missing after index maintenance.'
+        )
+    return True
+
+
 @contextmanager
-def search_indexes_suspended(scope=None):
+def search_indexes_suspended(scope=None, completion_barrier=None):
     """
-    Drop all non-unique search indexes for the duration of the block and
-    always rebuild them afterwards -- including when the block raises.
+    Drop the selected non-unique search indexes for the duration of the block
+    and always rebuild/validate them afterwards -- including when the block
+    raises.
 
     Crash-safe: if the process is SIGKILLed while indexes are dropped,
     the next fast import calls `ensure_search_indexes` in its `finally`
@@ -946,14 +981,30 @@ def search_indexes_suspended(scope=None):
     slower while suspended; exact lookups still work via seq scan or
     unique indexes.
     """
-    # Rebuild any leftovers from a previous crash before dropping again,
-    # so we don't start with a partially indexed state.
+    # Rebuild and validate leftovers from a previous crash before dropping
+    # anything again, so imports never run on an unknown index state.
     ensure_search_indexes()
+    validate_search_indexes()
     drop_search_indexes(scope)
     try:
         yield
     finally:
-        ensure_search_indexes()
+        try:
+            ensure_search_indexes()
+            validate_search_indexes()
+        except BaseException:
+            if completion_barrier is not None:
+                completion_barrier.fail()
+            raise
+        else:
+            if (
+                completion_barrier is not None
+                and not completion_barrier.complete()
+            ):
+                raise RuntimeError(
+                    'One or more import jobs could not complete after '
+                    'search-index maintenance.'
+                )
 
 
 def _is_candidate_file(filename, ext="*"):

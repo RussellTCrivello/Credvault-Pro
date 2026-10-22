@@ -42,7 +42,10 @@ from vault.import_app.import_engine import (
     release_lease,
     verify_import_job,
 )
-from vault.models import Account, Email, ImportJob, ImportRecord, Pass, Url, User
+from vault.models import (
+    Account, Email, ImportJob, ImportRecord, ImportStageRecord,
+    Pass, Url, User,
+)
 from vault.views import _paginate_accounts, filter_accounts
 
 
@@ -352,6 +355,56 @@ class DurableOutcomeAuditTests(TestCase):
                 user__name='first-user',
             ).exists())
             self.assertFalse(Account.objects.filter(
+                user__name='second-user',
+            ).exists())
+
+    def test_source_change_drains_every_already_accepted_staged_payload(self):
+        first_line = (
+            b'https://accepted-stage.example/login|first-user|'
+            b'synthetic-first-secret|192.0.2.71\n'
+        )
+        second_line = (
+            b'https://accepted-stage.example/login|second-user|'
+            b'synthetic-second-secret|192.0.2.72\n'
+        )
+        changed_second_line = (
+            b'https://accepted-stage.example/login|second-user|'
+            b'synthetic-second-secrex|192.0.2.72\n'
+        )
+        self.assertEqual(len(second_line), len(changed_second_line))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / 'accepted-stage-source.txt'
+            source_path.write_bytes(first_line + second_line)
+            mutation = {'done': False}
+
+            def edit_after_second_stage(position):
+                if position == 2 and not mutation['done']:
+                    source_path.write_bytes(first_line + changed_second_line)
+                    mutation['done'] = True
+
+            job = durable_import_file(
+                str(source_path), batch_rows=1,
+                on_progress=edit_after_second_stage,
+            )
+
+            job.refresh_from_db()
+            self.assertTrue(mutation['done'])
+            self.assertEqual(job.status, 'failed')
+            self.assertEqual(job.total_attempted, 2)
+            self.assertEqual(job.total_committed, 2)
+            self.assertEqual(job.records.filter(status='committed').count(), 2)
+            self.assertEqual(
+                ImportStageRecord.objects.filter(
+                    import_record__import_job_id=job.pk,
+                ).count(),
+                0,
+            )
+            self.assertEqual(Account.objects.count(), 2)
+            self.assertTrue(Account.objects.filter(
+                user__name='first-user',
+            ).exists())
+            self.assertTrue(Account.objects.filter(
                 user__name='second-user',
             ).exists())
 
@@ -852,11 +905,11 @@ django.setup()
 import vault.import_app.import_engine as engine
 from vault.models import ImportJob
 job = ImportJob.objects.get(job_id=os.environ["AUDIT_JOB_ID"])
-real_flush = engine._durable_flush_batch
-def commit_then_exit(*args, **kwargs):
-    real_flush(*args, **kwargs)
+real_stage = engine._durable_stage_batch
+def stage_then_exit(*args, **kwargs):
+    real_stage(*args, **kwargs)
     os._exit(73)
-engine._durable_flush_batch = commit_then_exit
+engine._durable_stage_batch = stage_then_exit
 engine.durable_import_file(
     os.environ["AUDIT_SOURCE_PATH"], job=job, batch_rows=1,
 )
@@ -890,8 +943,14 @@ os._exit(0)
             )
             job.refresh_from_db()
             self.assertEqual(job.status, 'processing')
-            self.assertEqual(job.records.filter(status='committed').count(), 1)
-            self.assertEqual(Account.objects.count(), 1)
+            self.assertEqual(job.records.filter(status='pending').count(), 1)
+            self.assertEqual(
+                ImportStageRecord.objects.filter(
+                    import_record__import_job=job,
+                ).count(),
+                1,
+            )
+            self.assertEqual(Account.objects.count(), 0)
 
             ImportJob.objects.filter(pk=job.pk).update(
                 lease_expires_at=timezone.now() - timezone.timedelta(seconds=1)
@@ -907,3 +966,107 @@ os._exit(0)
             self.assertEqual(job.total_committed, 2)
             self.assertEqual(Account.objects.count(), 2)
             self.assertEqual(job.records.count(), 2)
+
+    def test_recovery_finalizes_upload_stage_without_rereading_source(self):
+        class SimulatedWorkerDeath(BaseException):
+            pass
+
+        uploaded = SimpleUploadedFile(
+            'synthetic-upload.txt',
+            b'https://stage-recovery.example/login|stage-user|'
+            b'synthetic-stage-secret|192.0.2.171\n',
+        )
+        created = {}
+        real_stage = import_engine._durable_stage_batch
+
+        def stage_then_die(*args, **kwargs):
+            result = real_stage(*args, **kwargs)
+            raise SimulatedWorkerDeath()
+
+        with mock.patch.object(
+            import_engine, '_durable_stage_batch', stage_then_die,
+        ):
+            with self.assertRaises(SimulatedWorkerDeath):
+                durable_import_uploads(
+                    [uploaded], batch_rows=1,
+                    on_job_created=lambda job: created.setdefault('job', job),
+                )
+
+        job = created['job']
+        job.refresh_from_db()
+        self.assertEqual(job.status, 'processing')
+        self.assertEqual(Account.objects.count(), 0)
+        self.assertEqual(
+            ImportStageRecord.objects.filter(
+                import_record__import_job=job,
+            ).count(),
+            1,
+        )
+        ImportJob.objects.filter(pk=job.pk).update(
+            lease_expires_at=timezone.now() - timezone.timedelta(seconds=1),
+        )
+
+        log = recover_job(ImportJob.objects.get(pk=job.pk))
+
+        job.refresh_from_db()
+        self.assertEqual(log.outcome, 'success')
+        self.assertEqual(job.status, 'completed')
+        self.assertEqual(job.total_committed, 1)
+        self.assertEqual(Account.objects.count(), 1)
+        self.assertFalse(ImportStageRecord.objects.filter(
+            import_record__import_job=job,
+        ).exists())
+
+    def test_cancelled_job_recovery_only_cleans_accepted_stage(self):
+        class SimulatedWorkerDeath(BaseException):
+            pass
+
+        job = create_import_job(source_name='synthetic-cancelled-stage.txt')
+        job.total_discovered = 1
+        job.save(update_fields=['total_discovered'])
+        cancel_checks = {'count': 0}
+
+        def cancel_after_staging():
+            cancel_checks['count'] += 1
+            return cancel_checks['count'] > 1
+
+        def die_during_finalization(*args, **kwargs):
+            raise SimulatedWorkerDeath()
+
+        line = (
+            b'https://cancel-stage.example/login|cancel-user|'
+            b'synthetic-cancel-secret|192.0.2.172\n'
+        )
+        with mock.patch.object(
+            import_engine, '_durable_finalize_batch', die_during_finalization,
+        ):
+            with self.assertRaises(SimulatedWorkerDeath):
+                DurableImportSession(
+                    job, batch_rows=1, workers=1,
+                    cancel_check=cancel_after_staging,
+                ).run([line])
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, 'cancelled')
+        self.assertEqual(Account.objects.count(), 0)
+        self.assertEqual(
+            ImportStageRecord.objects.filter(
+                import_record__import_job=job,
+            ).count(),
+            1,
+        )
+        ImportJob.objects.filter(pk=job.pk).update(
+            lease_expires_at=timezone.now() - timezone.timedelta(seconds=1),
+        )
+        self.assertTrue(discover_interrupted_jobs().filter(pk=job.pk).exists())
+
+        log = recover_job(ImportJob.objects.get(pk=job.pk))
+
+        job.refresh_from_db()
+        self.assertEqual(log.outcome, 'success')
+        self.assertEqual(job.status, 'cancelled')
+        self.assertEqual(job.total_committed, 1)
+        self.assertEqual(Account.objects.count(), 1)
+        self.assertFalse(ImportStageRecord.objects.filter(
+            import_record__import_job=job,
+        ).exists())

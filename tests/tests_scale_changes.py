@@ -7,6 +7,9 @@ from django.db import IntegrityError, connection, transaction
 from django.test import TestCase, TransactionTestCase
 
 from vault.import_app import importer
+from vault.import_app.import_engine import (
+    DeferredImportCompletion, durable_import_path,
+)
 from vault.models import Account, Email, ImportJob, ImportRecord, Ip, Pass, Url
 from vault.validators import (
     _normalize_host_cached, _normalize_host_uncached, normalize_host,
@@ -77,6 +80,83 @@ class FastModeScopeTests(TransactionTestCase):
             self.assertIn('vault_acct_created_id_idx', during)
         self.assertTrue(before <= self._all_present())
 
+    def test_fast_job_is_completed_only_after_indexes_are_rebuilt(self):
+        import tempfile
+        from pathlib import Path
+
+        state = {'inside': False, 'job_id': None, 'status_during_rebuild': None}
+        real_ensure = importer.ensure_search_indexes
+
+        def observe_rebuild():
+            real_ensure()
+            if state['inside'] and state['job_id'] is not None:
+                state['status_during_rebuild'] = ImportJob.objects.get(
+                    pk=state['job_id'],
+                ).status
+
+        barrier = DeferredImportCompletion()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'synthetic-fast.txt'
+            source.write_bytes(
+                b'https://fast-barrier.example/login|barrier-user|'
+                b'synthetic-barrier-secret|192.0.2.181\n'
+            )
+            with mock.patch.object(
+                importer, 'ensure_search_indexes', observe_rebuild,
+            ):
+                with importer.search_indexes_suspended(
+                    completion_barrier=barrier,
+                ):
+                    state['inside'] = True
+                    job = durable_import_path(
+                        str(source), workers=1, batch_rows=1,
+                        completion_barrier=barrier,
+                    )
+                    state['job_id'] = job.pk
+                    self.assertEqual(job.status, 'processing')
+
+        self.assertEqual(state['status_during_rebuild'], 'processing')
+        self.assertEqual(job.status, 'completed')
+        self.assertEqual(job.total_committed, 1)
+
+    def test_fast_job_is_not_completed_when_index_validation_fails(self):
+        import tempfile
+        from pathlib import Path
+
+        barrier = DeferredImportCompletion()
+        real_validate = importer.validate_search_indexes
+        validation_calls = {'count': 0}
+
+        def fail_after_rebuild():
+            validation_calls['count'] += 1
+            if validation_calls['count'] == 2:
+                raise RuntimeError('simulated missing search index')
+            return real_validate()
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'synthetic-index-failure.txt'
+            source.write_bytes(
+                b'https://fast-index-failure.example/login|index-user|'
+                b'synthetic-index-secret|192.0.2.182\n'
+            )
+            with mock.patch.object(
+                importer, 'validate_search_indexes', fail_after_rebuild,
+            ):
+                with self.assertRaisesRegex(RuntimeError, 'simulated missing'):
+                    with importer.search_indexes_suspended(
+                        completion_barrier=barrier,
+                    ):
+                        job = durable_import_path(
+                            str(source), workers=1, batch_rows=1,
+                            completion_barrier=barrier,
+                        )
+                        self.assertEqual(job.status, 'processing')
+
+        job.refresh_from_db()
+        self.assertEqual(validation_calls['count'], 2)
+        self.assertEqual(job.status, 'failed')
+        self.assertEqual(job.records.filter(status='committed').count(), 1)
+
     def test_all_scope_is_opt_in_and_always_restored(self):
         before = self._all_present()
         with mock.patch.dict(os.environ, {'VAULT_FAST_MODE_SCOPE': 'all'}):
@@ -138,7 +218,9 @@ class ReferenceCacheImportTests(TransactionTestCase):
             with open(path, 'w') as handle:
                 handle.write('\n'.join(lines) + '\n')
             with mock.patch.object(import_engine, 'MAX_REFERENCE_CACHE_VALUES', 2):
-                job = import_engine.durable_import_path(path, batch_rows=10)
+                job = import_engine.durable_import_path(
+                    path, batch_rows=10, bulk_finalize=False,
+                )
         self.assertEqual(job.status, 'completed')
         self.assertEqual(Account.objects.count(), 60)
         self.assertEqual(job.total_committed, 60)
@@ -164,7 +246,9 @@ class ReferenceCacheImportTests(TransactionTestCase):
             with mock.patch.object(import_engine, '_durable_flush_batch',
                                    failing_flush):
                 try:
-                    import_engine.durable_import_path(path, batch_rows=1)
+                    import_engine.durable_import_path(
+                        path, batch_rows=1, bulk_finalize=False,
+                    )
                 except Exception:
                     pass
         self.assertEqual(captured['seen']['url'], set())
