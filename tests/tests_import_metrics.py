@@ -4,12 +4,17 @@ import logging
 import os
 import shutil
 import tempfile
+import time
+from types import SimpleNamespace
 from unittest import mock
 
-from django.test import TestCase, TransactionTestCase
+from django.test import SimpleTestCase, TestCase, TransactionTestCase, override_settings
 
 from vault.import_app import import_metrics
-from vault.import_app.import_engine import durable_import_file
+from vault.import_app.import_engine import (
+    DurableImportSession,
+    durable_import_file,
+)
 from vault.import_app.import_metrics import ImportMetrics
 from vault.models import Account
 
@@ -85,6 +90,36 @@ class ImportMetricsTests(TestCase):
             metrics.log_summary()
 
 
+class ImportSessionPolicyTests(SimpleTestCase):
+    def test_direct_is_default_but_existing_job_mode_is_preserved(self):
+        job = SimpleNamespace(options={})
+        with override_settings(VAULT_IMPORT_MODE="direct"):
+            session = DurableImportSession(job, batch_rows=1, workers=1)
+            self.assertFalse(session._bulk_finalize)
+            self.assertEqual(session._import_mode, "direct")
+
+        staged_job = SimpleNamespace(options={"import_mode": "staged"})
+        with override_settings(VAULT_IMPORT_MODE="direct"):
+            session = DurableImportSession(
+                staged_job, batch_rows=1, workers=1,
+            )
+            self.assertTrue(session._bulk_finalize)
+            self.assertEqual(session._import_mode, "staged")
+
+    @override_settings(VAULT_IMPORT_TIMEOUT_SECONDS=1)
+    def test_overall_timeout_requests_graceful_interruption(self):
+        job = SimpleNamespace(job_id="synthetic-timeout-job", options={})
+        session = DurableImportSession(job, batch_rows=1, workers=1)
+        session._started_monotonic = time.monotonic() - 2
+        with self.assertLogs(
+            "vault.import_app.import_engine", level="WARNING",
+        ) as logs:
+            self.assertTrue(session._check_timeout())
+        self.assertTrue(session._timed_out)
+        self.assertTrue(session._interrupted)
+        self.assertIn("configured 1-second timeout", logs.output[0])
+
+
 class EngineMetricsTests(TransactionTestCase):
     def setUp(self):
         self.directory = tempfile.mkdtemp()
@@ -103,11 +138,14 @@ class EngineMetricsTests(TransactionTestCase):
                                 {'VAULT_IMPORT_METRICS_INTERVAL': '3600'}):
             job = durable_import_file(path, batch_rows=10)
         self.assertEqual(Account.objects.count(), 25)
+        job.refresh_from_db()
+        self.assertEqual(job.options.get('import_mode'), 'direct')
         summary = [line for line in logs.output if 'event=summary' in line]
         self.assertEqual(len(summary), 1)
         self.assertIn(' items=25 ', summary[0] + ' ')
         self.assertIn(' valid_rows=25 ', summary[0] + ' ')
         self.assertIn(' batches=3 ', summary[0] + ' ')
+        self.assertIn(' mode=direct ', summary[0] + ' ')
         joined = '\n'.join(logs.output)
         for forbidden in (secret, 'example.com', 'user1@', '203.0.113'):
             self.assertNotIn(forbidden, joined)

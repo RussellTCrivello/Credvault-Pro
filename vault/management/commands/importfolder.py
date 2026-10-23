@@ -11,7 +11,9 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from django.core.management.base import BaseCommand, CommandError
 from django.db import close_old_connections, connections
 
-from vault.import_app.import_engine import SourceChangedError, durable_import_path
+from vault.import_app.import_engine import (
+    DeferredImportCompletion, SourceChangedError, durable_import_path,
+)
 from vault.import_app.importer import (
     collect_files_from_path,
     search_indexes_suspended,
@@ -98,21 +100,31 @@ class Command(BaseCommand):
         # The opt-in file mode expands directories into sorted, independent
         # file jobs, so each file retains its own manifest/checkpoint/recovery
         # identity and source positions remain deterministic within that file.
-        context = search_indexes_suspended() if fast else _null_context()
+        completion_barrier = DeferredImportCompletion() if fast else None
+        context = (
+            search_indexes_suspended(
+                completion_barrier=completion_barrier,
+            ) if fast else _null_context()
+        )
         with context:
             if parallel_files == 1:
                 sources = [(base, ext) for base in paths]
-                jobs, errors = self._run_sequential(sources)
+                jobs, errors = self._run_sequential(
+                    sources, completion_barrier=completion_barrier,
+                )
             else:
                 sources = self._expand_file_sources(paths, ext)
                 if len(sources) > 1:
                     jobs, errors = self._run_parallel(
                         sources, parallel_files,
+                        completion_barrier=completion_barrier,
                     )
                 else:
                     # Do not disable the normal per-file parser pool when
                     # there is no independent file work to schedule.
-                    jobs, errors = self._run_sequential(sources)
+                    jobs, errors = self._run_sequential(
+                        sources, completion_barrier=completion_barrier,
+                    )
 
         total_created = 0
         total_skipped = 0
@@ -192,11 +204,13 @@ class Command(BaseCommand):
                 sources.append((base, ext))
         return sources
 
-    def _run_sequential(self, sources):
+    def _run_sequential(self, sources, completion_barrier=None):
         jobs = []
         for path, ext in sources:
             try:
-                jobs.append(durable_import_path(path, ext=ext))
+                jobs.append(durable_import_path(
+                    path, ext=ext, completion_barrier=completion_barrier,
+                ))
             except SourceChangedError as exc:
                 raise CommandError(
                     f'{path}: {exc} Keep the source unchanged and '
@@ -204,7 +218,7 @@ class Command(BaseCommand):
                 ) from exc
         return jobs, []
 
-    def _run_parallel(self, sources, parallel_files):
+    def _run_parallel(self, sources, parallel_files, completion_barrier=None):
         """Run independent file jobs with a bounded submission queue."""
         jobs = [None] * len(sources)
         errors = []
@@ -220,6 +234,7 @@ class Command(BaseCommand):
                     path,
                     ext=source_ext,
                     workers=1,
+                    completion_barrier=completion_barrier,
                 )
             finally:
                 # ``close_old_connections`` only closes expired/unusable

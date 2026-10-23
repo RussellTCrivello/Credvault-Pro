@@ -251,8 +251,14 @@ class CopyConversionTests(TestCase):
             source.commit()
             source.close()
 
+            with connection.cursor() as cursor:
+                cursor.execute('SELECT current_database()')
+                database_name = cursor.fetchone()[0]
             with self.assertRaises(CommandError) as raised:
-                call_command('copy_from_sqlite', path)
+                call_command(
+                    'copy_from_sqlite', path,
+                    confirm_database=database_name,
+                )
             self.assertIn('updated_at', str(raised.exception))
 
             # The failed copy saved nothing.

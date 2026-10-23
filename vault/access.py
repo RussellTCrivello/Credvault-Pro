@@ -38,7 +38,7 @@ class AdministratorLoginForm(AuthenticationForm):
 
 
 class AdministratorLoginView(LoginView):
-    template_name = 'vault/login.html'
+    template_name = 'login/login.html'
     authentication_form = AdministratorLoginForm
     redirect_authenticated_user = False  # handled in get() below
 

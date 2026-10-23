@@ -47,8 +47,8 @@ from vault.import_app.import_engine import (
     _durable_flush_batch, _hash_source_line, _write_ledger_entries,
 )
 from vault.models import (
-    Account, Email, ImportJob, ImportRecord, ImportRecoveryLog, Ip, Pass,
-    Url, User, record_fingerprint,
+    Account, Email, ImportJob, ImportRecord, ImportRecoveryLog,
+    ImportStageRecord, Ip, Pass, Url, User, record_fingerprint,
 )
 from vault.utils import MAX_SOURCE_LINE_BYTES, parse_line
 
@@ -301,6 +301,32 @@ class ImportJobModelTests(TestCase):
         
         self.assertEqual(job.progress_percent, 90.0)
 
+    def test_retryable_failed_stage_is_not_counted_twice_in_progress(self):
+        job = create_import_job(source_name='retryable-stage.txt')
+        job.total_discovered = 2
+        job.total_attempted = 1
+        job.save(update_fields=['total_discovered', 'total_attempted'])
+        record = ImportRecord.objects.create(
+            import_job=job,
+            source_position=1,
+            source_hash='synthetic-hash',
+            status='failed',
+            retryable=True,
+            idempotency_key=ImportRecord.compute_idempotency_key(
+                job.job_id, 1,
+            ),
+        )
+        ImportStageRecord.objects.create(
+            import_record=record,
+            url='https://retryable-stage.example/login',
+            account_type='user',
+            ident='retryable-user',
+            secret='synthetic-retryable-secret',
+        )
+
+        self.assertEqual(job.total_staged, 1)
+        self.assertEqual(job.progress_percent, 50.0)
+
 
 class ImportRecordModelTests(TestCase):
     """Test the ImportRecord model and idempotency keys."""
@@ -432,6 +458,46 @@ class DurableImportSessionBasicTests(TestCase):
         ]
         self.assertIn('set local synchronous_commit = on', settings)
         self.assertNotIn('set local synchronous_commit = off', settings)
+
+    def test_forward_lookup_does_not_skip_existing_pending_ledger_rows(self):
+        job = create_import_job(source_name='synthetic-pending-ledger.txt')
+        line = (
+            b'https://pending-ledger.example/login|pending-user|'
+            b'synthetic-pending-secret|192.0.2.177\n'
+        )
+        key = ImportRecord.compute_idempotency_key(job.job_id, 1)
+        record = ImportRecord.objects.create(
+            import_job=job,
+            source_position=1,
+            source_hash=_hash_source_line(line),
+            status='pending',
+            idempotency_key=key,
+        )
+
+        committed = _durable_flush_batch(
+            [(
+                'https://pending-ledger.example/login',
+                'user',
+                'pending-user',
+                'synthetic-pending-secret',
+                '192.0.2.177',
+            )],
+            [{
+                'source_position': 1,
+                'source_hash': _hash_source_line(line),
+                'idempotency_key': key,
+            }],
+            job.pk,
+        )
+
+        record.refresh_from_db()
+        job.refresh_from_db()
+        self.assertEqual(committed, 1)
+        self.assertEqual(record.status, 'committed')
+        self.assertIsNotNone(record.account_id)
+        self.assertEqual(job.total_attempted, 1)
+        self.assertEqual(job.total_committed, 1)
+        self.assertEqual(Account.objects.count(), 1)
 
     def test_invalid_lines_recorded_as_skipped(self):
         """Invalid lines are recorded as skipped."""
@@ -712,24 +778,27 @@ class CrashRecoveryTests(TestCase):
 
     def _kill_worker_after(self, job, committed_batches, batch_rows=3):
         """Run the durable import, killing the worker right after the
-        given number of batch flushes -- after the database commit, but
-        before the session (the caller) has processed the result."""
-        real_flush = import_engine._durable_flush_batch
-        state = {'flushed': 0}
+        given number of staging transactions -- after accepted rows are
+        durably staged, but before the session receives acknowledgement."""
+        real_stage = import_engine._durable_stage_batch
+        state = {'staged': 0}
 
-        def crashing_flush(rows, record_metas, job_pk, **kw):
-            committed = real_flush(rows, record_metas, job_pk, **kw)
-            state['flushed'] += 1
-            if state['flushed'] >= committed_batches:
+        def crashing_stage(rows, record_metas, job_pk, **kw):
+            staged = real_stage(rows, record_metas, job_pk, **kw)
+            state['staged'] += 1
+            if state['staged'] >= committed_batches:
                 raise _SimulatedWorkerKill()
-            return committed
+            return staged
 
         with mock.patch.object(
-            import_engine, '_durable_flush_batch', crashing_flush
+            import_engine, '_durable_stage_batch', crashing_stage
         ):
             with self.assertRaises(_SimulatedWorkerKill):
                 durable_import_file(
-                    self.source_path, job=job, batch_rows=batch_rows,
+                    self.source_path,
+                    job=job,
+                    batch_rows=batch_rows,
+                    bulk_finalize=True,
                 )
 
     def test_kill_after_commit_before_ack_resumes_without_duplicates(self):
@@ -740,18 +809,19 @@ class CrashRecoveryTests(TestCase):
         )
         self._kill_worker_after(job, committed_batches=2)
 
-        # The kill left the job 'processing' with two committed batches:
-        # 6 accounts and their 6 ledger rows (committed together in one
-        # transaction), while the skipped-ledger row for the invalid line
-        # at position 4 and the tail line at position 8 were in memory
-        # only and are gone.
+        # The kill left six valid payloads durably staged and the invalid
+        # line at position 4 terminal in the ledger. No Account was finalized
+        # before the worker died, and positions 7-8 remain unread.
         job.refresh_from_db()
         self.assertEqual(job.status, 'processing')
-        self.assertEqual(job.records.filter(status='committed').count(), 6)
-        self.assertEqual(Account.objects.count(), 6)
-        fingerprints_before = set(
-            Account.objects.values_list('fingerprint', flat=True)
+        self.assertEqual(job.records.filter(status='pending').count(), 6)
+        self.assertEqual(job.records.filter(status='skipped').count(), 1)
+        self.assertEqual(
+            ImportStageRecord.objects.filter(import_record__import_job=job).count(),
+            6,
         )
+        self.assertEqual(Account.objects.count(), 0)
+        fingerprints_before = set()
 
         # Time passes: the crashed worker's lease expires and discovery
         # finds the abandoned job.
@@ -811,7 +881,7 @@ class CrashRecoveryTests(TestCase):
         out = io.StringIO()
         call_command('recoverimports', '--run', stdout=out)
         self.assertIn('No recoverable import jobs.', out.getvalue())
-        self.assertEqual(Account.objects.count(), 6)
+        self.assertEqual(Account.objects.count(), 0)
 
         ImportJob.objects.filter(pk=job.pk).update(
             lease_expires_at=timezone.now() - timezone.timedelta(seconds=1)
@@ -819,7 +889,7 @@ class CrashRecoveryTests(TestCase):
         listing = io.StringIO()
         call_command('recoverimports', stdout=listing)
         self.assertIn(str(job.job_id), listing.getvalue())
-        self.assertEqual(Account.objects.count(), 6, 'listing must not import')
+        self.assertEqual(Account.objects.count(), 0, 'listing must not import')
 
         out = io.StringIO()
         call_command('recoverimports', '--run', stdout=out)
@@ -849,6 +919,161 @@ class CrashRecoveryTests(TestCase):
              job.total_skipped, job.total_failed),
             (8, 7, 1, 0),
         )
+
+    def test_recoverimports_reconciles_abandoned_upload_without_stage_or_source(self):
+        job = create_import_job(
+            source_name="synthetic-direct-upload.txt",
+            options={"source_kind": "upload", "source_replayable": False},
+        )
+        worker_id = "abandoned-direct-upload-worker"
+        self.assertTrue(job.mark_started(worker_id=worker_id))
+        record = ImportRecord.objects.create(
+            import_job=job,
+            source_position=1,
+            source_hash="synthetic-ledger-hash",
+            source_line="",
+            status="committed",
+            idempotency_key=ImportRecord.compute_idempotency_key(job.job_id, 1),
+        )
+        job.total_discovered = 1
+        job.save(update_fields=["total_discovered"])
+        ImportJob.objects.filter(pk=job.pk).update(
+            lease_expires_at=timezone.now() - timezone.timedelta(seconds=1),
+        )
+
+        listing = io.StringIO()
+        call_command("recoverimports", stdout=listing)
+        self.assertIn(str(job.job_id), listing.getvalue())
+        self.assertEqual(
+            ImportStageRecord.objects.filter(import_record__import_job=job).count(),
+            0,
+        )
+
+        output = io.StringIO()
+        call_command("recoverimports", "--run", "--job", str(job.job_id), stdout=output)
+        self.assertIn("recovery success; job now completed", output.getvalue())
+        job.refresh_from_db()
+        record.refresh_from_db()
+        self.assertEqual(job.status, "completed")
+        self.assertEqual(job.total_attempted, 1)
+        self.assertEqual(job.total_committed, 1)
+        self.assertEqual(record.status, "committed")
+        self.assertEqual(
+            ImportStageRecord.objects.filter(import_record__import_job=job).count(),
+            0,
+        )
+
+    def test_recoverimports_drains_cancelled_upload_payloads_without_replay(self):
+        job = create_import_job(
+            source_name="synthetic-cancelled-upload.txt",
+            options={"source_kind": "upload", "source_replayable": False},
+        )
+        worker_id = "crashed-upload-worker"
+        self.assertTrue(job.mark_started(worker_id=worker_id))
+        source_line = (
+            b"https://cancelled-stage.example/login|"
+            b"synthetic-cancelled-user|synthetic-cancelled-password\n"
+        )
+        record = ImportRecord.objects.create(
+            import_job=job,
+            source_position=1,
+            source_hash=hashlib.sha256(source_line).hexdigest(),
+            source_line="",
+            status="pending",
+            idempotency_key=ImportRecord.compute_idempotency_key(job.job_id, 1),
+        )
+        ImportStageRecord.objects.create(
+            import_record=record,
+            url="https://cancelled-stage.example/login",
+            account_type="user",
+            ident="synthetic-cancelled-user",
+            secret="synthetic-cancelled-password",
+            ip=None,
+        )
+        job.total_discovered = 1
+        job.save(update_fields=["total_discovered"])
+        self.assertTrue(job.mark_cancelled(worker_id=worker_id))
+        ImportJob.objects.filter(pk=job.pk).update(
+            lease_expires_at=timezone.now() - timezone.timedelta(seconds=1),
+        )
+        self.assertTrue(discover_interrupted_jobs().filter(pk=job.pk).exists())
+
+        listing = io.StringIO()
+        call_command("recoverimports", stdout=listing)
+        self.assertIn(str(job.job_id), listing.getvalue())
+        self.assertNotIn("synthetic-cancelled-password", listing.getvalue())
+        self.assertEqual(
+            ImportStageRecord.objects.filter(import_record__import_job=job).count(),
+            1,
+        )
+
+        output = io.StringIO()
+        call_command("recoverimports", "--run", "--job", str(job.job_id), stdout=output)
+        self.assertIn("recovery success; job now cancelled", output.getvalue())
+        self.assertNotIn("synthetic-cancelled-password", output.getvalue())
+        job.refresh_from_db()
+        record.refresh_from_db()
+        self.assertEqual(job.status, "cancelled")
+        self.assertEqual(job.total_attempted, 1)
+        self.assertEqual(job.total_committed, 1)
+        self.assertEqual(record.status, "committed")
+        self.assertEqual(
+            ImportStageRecord.objects.filter(import_record__import_job=job).count(),
+            0,
+        )
+        self.assertEqual(Account.objects.count(), 1)
+
+    def test_recoverimports_drains_interrupted_upload_stage_then_reports_gap(self):
+        job = create_import_job(
+            source_name="synthetic-interrupted-upload.txt",
+            options={"source_kind": "upload", "source_replayable": False},
+        )
+        worker_id = "interrupted-upload-worker"
+        self.assertTrue(job.mark_started(worker_id=worker_id))
+        source_line = (
+            b"https://interrupted-stage.example/login|"
+            b"synthetic-interrupted-user|synthetic-interrupted-password\n"
+        )
+        record = ImportRecord.objects.create(
+            import_job=job,
+            source_position=1,
+            source_hash=hashlib.sha256(source_line).hexdigest(),
+            source_line="",
+            status="pending",
+            idempotency_key=ImportRecord.compute_idempotency_key(job.job_id, 1),
+        )
+        ImportStageRecord.objects.create(
+            import_record=record,
+            url="https://interrupted-stage.example/login",
+            account_type="user",
+            ident="synthetic-interrupted-user",
+            secret="synthetic-interrupted-password",
+            ip=None,
+        )
+        job.total_discovered = 2
+        job.save(update_fields=["total_discovered"])
+        ImportJob.objects.filter(pk=job.pk).update(
+            lease_expires_at=timezone.now() - timezone.timedelta(seconds=1),
+        )
+
+        output = io.StringIO()
+        call_command("recoverimports", "--run", "--job", str(job.job_id), stdout=output)
+        self.assertIn("recovery partial; job now paused", output.getvalue())
+        self.assertNotIn("synthetic-interrupted-password", output.getvalue())
+        job.refresh_from_db()
+        record.refresh_from_db()
+        self.assertEqual(job.status, "paused")
+        self.assertEqual(job.total_discovered, 2)
+        self.assertEqual(job.total_attempted, 1)
+        self.assertEqual(job.total_committed, 1)
+        self.assertEqual(job.remaining_count, 1)
+        self.assertEqual(record.status, "committed")
+        self.assertEqual(
+            ImportStageRecord.objects.filter(import_record__import_job=job).count(),
+            0,
+        )
+        self.assertEqual(Account.objects.count(), 1)
+        self.assertFalse(job.can_resume())
 
     def test_resume_view_reprocesses_abandoned_source_file(self):
         """The Resume action on the job page re-reads the recorded source
@@ -1106,13 +1331,25 @@ class ImportManagementViewTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, 'Verification')
 
-    def test_import_job_records_page_renders(self):
-        """Import job records page renders successfully."""
+    def test_import_job_records_page_renders_without_exposing_source_hashes(self):
+        """Review pages show row outcomes, not hashes of credential lines."""
         job = create_import_job(source_name='test.txt')
+        source_hash = hashlib.sha256(b'synthetic-user:credential-value').hexdigest()
+        ImportRecord.objects.create(
+            import_job=job,
+            source_position=1,
+            source_hash=source_hash,
+            source_line='',
+            status='failed',
+            error_category='invalid_format',
+            idempotency_key=ImportRecord.compute_idempotency_key(job.job_id, 1),
+        )
         response = self.client.get(
             reverse('vault:import_job_records', args=[job.job_id])
         )
         self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'invalid_format')
+        self.assertNotContains(response, source_hash[:20])
 
     def test_import_job_cancel_action(self):
         """Cancel action works via POST."""
@@ -1213,7 +1450,7 @@ class ParallelFileImportTests(TransactionTestCase):
             output = io.StringIO()
             call_command(
                 'importfolder', directory, parallel_files=2, quiet=True,
-                stdout=output,
+                fast=True, stdout=output,
             )
 
         jobs = list(ImportJob.objects.order_by('source_path'))
@@ -1225,6 +1462,62 @@ class ParallelFileImportTests(TransactionTestCase):
         self.assertEqual(ImportRecord.objects.count(), 4)
         self.assertEqual(Account.objects.count(), 3)
 
+
+
+class LongBatchLeaseRenewalTests(TransactionTestCase):
+    reset_sequences = True
+
+    def test_long_direct_and_staged_batches_renew_from_completion_time(self):
+        real_advance = import_engine._advance_import_checkpoint
+        real_fingerprint = import_engine.record_fingerprint
+
+        def delayed_result(result):
+            # Exceed the deliberately short lease while the durable batch
+            # still owns the job-row lock, then ensure it renews from its
+            # completion time before committing.
+            time.sleep(1.2)
+            return result
+
+        def slow_advance(cursor, job_pk, checkpoint):
+            return delayed_result(real_advance(cursor, job_pk, checkpoint))
+
+        def slow_fingerprint(*args, **kwargs):
+            return delayed_result(real_fingerprint(*args, **kwargs))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for mode in ("direct", "staged"):
+                source_path = os.path.join(temp_dir, f"{mode}.txt")
+                with open(source_path, "wb") as source:
+                    source.write(
+                        f"https://lease-{mode}.example/login|"
+                        f"lease-user-{mode}|synthetic-lease-secret|"
+                        f"192.0.2.181\n".encode("ascii")
+                    )
+                hook_name, hook = (
+                    ("record_fingerprint", slow_fingerprint)
+                    if mode == "direct"
+                    else ("_advance_import_checkpoint", slow_advance)
+                )
+                with mock.patch.object(
+                    import_engine, hook_name, side_effect=hook,
+                ) as delayed_hook:
+                    with (
+                        mock.patch.object(import_engine, "IMPORT_LEASE_SECONDS", 1),
+                        mock.patch("vault.models.IMPORT_LEASE_SECONDS", 1),
+                    ):
+                        job = durable_import_file(
+                            source_path,
+                            batch_rows=1,
+                            bulk_finalize=(mode == "staged"),
+                        )
+                    self.assertEqual(delayed_hook.call_count, 1, mode)
+                job.refresh_from_db()
+                self.assertEqual(job.status, "completed", mode)
+                self.assertEqual(job.total_attempted, 1, mode)
+                self.assertEqual(job.total_committed, 1, mode)
+                self.assertFalse(ImportStageRecord.objects.filter(
+                    import_record__import_job=job,
+                ).exists(), mode)
 
 
 class OversizedImportTests(TestCase):

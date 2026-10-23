@@ -1,9 +1,9 @@
 """
 High-throughput bulk importer for the normalized vault.
 
-The importer streams the input in batches of ``stage_rows()`` lines (250,000
-rows by default, more on a machine with free memory), so memory stays flat
-across millions of lines and thousands of files:
+The importer streams the input in batches of ``stage_rows()`` lines (25,000
+rows by default), bounding both memory and the duration of each durable
+transaction across millions of lines and thousands of files:
 
   1. Validate every field against its format and keep only its canonical
      spelling (see vault.validators). A line that does not match its format
@@ -34,9 +34,9 @@ directly do not get job tracking or automatic recovery.
 
 Speed for very large jobs:
 
-* Batches hold ``VAULT_IMPORT_BATCH_ROWS`` rows (250,000 by default, more on
-  a machine with plenty of free memory), so the per-batch transaction, ANALYZE
-  and planning overhead is spread over more lines.
+* Batches hold at most ``VAULT_IMPORT_BATCH_ROWS`` rows (25,000 by default).
+  The conservative ceiling keeps durable transactions and lease/cancellation
+  response bounded; operators may lower it for slower storage or less memory.
 * Parsing and canonicalizing run in worker processes (``VAULT_IMPORT_WORKERS``,
   default: up to 4 or the CPU count) while the previous batch is already being
   copied and merged, so parsing overlaps the database round-trips instead of
@@ -197,12 +197,13 @@ def refresh_stale_reference_stats(cursor):
             cursor.execute(f'ANALYZE {table}')
     return stale
 
-#: Rows per COPY batch; one transaction per batch keeps memory bounded. The
-#: measured default is 250,000; very large batches add memory and commit cost.
-#: An operator override is supported, but is capped at one million rows.
-DEFAULT_STAGE_ROWS = 250000
-MAX_IMPORT_BATCH_ROWS = 1000000
-#: 700 buffered rows per free MB lowers the default on memory-constrained hosts.
+#: Rows per durable COPY/flush batch. A 250k-line controlled run showed that
+#: large single transactions can exceed the 300-second worker lease on modest
+#: storage; 25k batches completed reliably and remained fast. Overrides may
+#: lower, but cannot raise, this conservative transaction-size ceiling.
+DEFAULT_STAGE_ROWS = 25000
+MAX_IMPORT_BATCH_ROWS = 25000
+#: Memory-aware sizing can reduce the default on constrained hosts.
 _ROWS_PER_FREE_MB = 700
 
 #: Hard upper bound for parse subprocesses, including explicit environment
@@ -401,10 +402,10 @@ def stage_rows():
     """
     Rows per batch.
 
-    ``VAULT_IMPORT_BATCH_ROWS`` wins and is capped at one million rows to
-    prevent an accidental unbounded Python buffer. Otherwise the default is
-    ``DEFAULT_STAGE_ROWS`` (250,000 rows); it only shrinks when the machine or
-    container has very little free memory.
+    ``VAULT_IMPORT_BATCH_ROWS`` may reduce the 25,000-row default; values
+    above the hard ceiling are clamped to it to keep durable transactions
+    short enough for lease, cancellation, and recovery handling. On a memory-
+    constrained host the default may shrink further.
     """
     raw = os.environ.get("VAULT_IMPORT_BATCH_ROWS")
     if raw:
@@ -734,13 +735,12 @@ def bulk_import_lines(parsed_iter):
 # `vault_account` also cost a large fraction of the per-batch time for
 # an 18M-line file (measured: ~7s per 100k for references alone).
 #
-# Fast mode drops *all* non-unique search indexes for the duration and
-# rebuilds them once at the end. Unique constraints (`name` and
-# `fingerprint`) and primary keys stay in place, so deduplication and
-# referential integrity are unaffected. Exact searches still work (via
-# sequential scan) while the indexes are suspended; substring searches
-# are slower until rebuild — same policy as before, just extended to
-# all non-essential indexes for the 18M target.
+# Fast mode suspends a configured subset of non-unique search indexes and
+# rebuilds them once at the end. Unique constraints (`name` and `fingerprint`)
+# and primary keys always stay in place; job-scoped ledger position/status
+# indexes also remain online for bounded staged finalization and recovery.
+# Exact searches still work (via sequential scan) while eligible indexes are
+# suspended; substring searches are slower until rebuild.
 #
 # The rebuild uses `maintenance_work_mem` for speed and is crash-safe:
 # `ensure_search_indexes` is idempotent (IF NOT EXISTS) and is called
@@ -811,9 +811,10 @@ _FAST_MODE_INDEXES = (
     ("vault_acct_created_id_idx",
      "CREATE INDEX vault_acct_created_id_idx ON public.vault_account USING btree (created_at DESC, id)"),
 
-    # ledger table: non-unique indexes (FKs, status, job_pos, etc.)
-    # Dropping these during fast import cuts ledger INSERT cost.
-    # Unique indexes (pkey, idempotency_key_key) stay.
+    # ledger table: the account FK index can be suspended. The job/status
+    # and job/position indexes remain online in ``all`` scope because staged
+    # finalization, checkpoint advancement and recovery depend on them.
+    # Unique indexes (pkey, idempotency_key_key) are never dropped.
     ("vault_importrec_job_pos_idx",
      "CREATE INDEX vault_importrec_job_pos_idx ON public.vault_importrecord USING btree (import_job_id, source_position)"),
     ("vault_importrec_job_status_idx",
@@ -840,9 +841,10 @@ def fast_mode_scope():
     ``search`` suspends only the five ``pg_trgm`` substring indexes -- what
     the documentation always promised -- so exact searches, record lookups
     and every foreign-key path stay indexed while the import runs.
-    ``all`` (``VAULT_FAST_MODE_SCOPE=all``) additionally drops the btree
-    indexes on the reference, account and ledger tables; it is meant for an
-    offline load because lookups degrade badly meanwhile (README, "Fast mode").
+    ``all`` (``VAULT_FAST_MODE_SCOPE=all``) additionally drops most btree
+    indexes on the reference, account and ledger tables for an offline load.
+    The job-scoped ledger position/status indexes stay online because staged
+    finalization and recovery rely on them to bound reconciliation queries.
     """
     value = os.environ.get("VAULT_FAST_MODE_SCOPE", "search").strip().lower()
     return value if value in FAST_MODE_SCOPES else "search"
@@ -850,94 +852,175 @@ def fast_mode_scope():
 
 def _suspended_indexes(scope):
     if scope == "all":
-        return _FAST_MODE_INDEXES
+        required_for_finalization = {
+            "vault_importrec_job_pos_idx",
+            "vault_importrec_job_status_idx",
+        }
+        return tuple(
+            item for item in _FAST_MODE_INDEXES
+            if item[0] not in required_for_finalization
+        )
     return tuple(item for item in _FAST_MODE_INDEXES
                  if item[0].endswith("_trgm"))
 
 
+def _is_pending_trigger_error(exc):
+    """Whether PostgreSQL rejected index DDL inside a TestCase transaction."""
+    return (
+        'pending trigger events' in str(exc).lower()
+        or 'objectinuse' in type(exc).__name__.lower()
+    )
+
+
 def drop_search_indexes(scope=None):
     """Drop the indexes fast mode suspends (see ``fast_mode_scope``)."""
-    indexes = _suspended_indexes(scope or fast_mode_scope())
-    # DROP INDEX is safe inside a transaction, but we still handle errors
-    # for test transactions that have pending triggers.
-    try:
-        with transaction.atomic(), connection.cursor() as cursor:
-            for name, _ddl in indexes:
-                try:
-                    cursor.execute(f"DROP INDEX IF EXISTS {name}")
-                except Exception:
-                    # In Django TestCase, DROP inside a transaction that
-                    # modified the table can still succeed, but if it fails
-                    # due to pending triggers, ignore — the index will be
-                    # dropped on next fast import outside the test tx.
-                    continue
-    except Exception:
-        # If the outer transaction already has pending triggers (TestCase),
-        # the whole atomic block may fail on first CREATE. Fall back to
-        # dropping one by one outside atomic.
-        for name, _ddl in indexes:
-            try:
-                with connection.cursor() as cursor:
-                    cursor.execute(f"DROP INDEX IF EXISTS {name}")
-            except Exception:
+    for name, _ddl in _suspended_indexes(scope or fast_mode_scope()):
+        try:
+            # An individual savepoint prevents one failed DROP from aborting
+            # later DDL when a caller is already inside a Django transaction.
+            with transaction.atomic(), connection.cursor() as cursor:
+                cursor.execute(f"DROP INDEX IF EXISTS {name}")
+        except Exception as exc:
+            # Django TestCase has pending trigger events until its outer
+            # transaction commits, so PostgreSQL will not permit index DDL.
+            # This is the only expected deferral; other errors must surface.
+            if _is_pending_trigger_error(exc):
                 continue
+            raise RuntimeError(
+                f'Could not drop fast-mode search index {name}.'
+            ) from exc
 
 
-def ensure_search_indexes():
+def ensure_search_indexes(concurrently=None):
     """
-    Create all fast-mode search indexes when missing.
+    Create all fast-mode indexes when missing, using online builds when safe.
 
-    ``maintenance_work_mem`` is raised for the build so large reference
-    and account tables index quickly; the setting is local to this
-    transaction. Idempotent (IF NOT EXISTS) — safe to call after a crash
-    that left indexes dropped.
-
-    Crash-safe and TestCase-safe: each CREATE is attempted individually;
-    if it fails due to pending trigger events (Django TestCase wraps
-    each test in a transaction that has already modified the table),
-    it is skipped — the index will be rebuilt after the test transaction
-    commits, or on next fast import.
+    ``maintenance_work_mem`` is raised only in the current session. Outside
+    an atomic transaction the indexes are built CONCURRENTLY so deployment or
+    crash-recovery maintenance does not block ordinary writes. In a caller's
+    transaction we use ordinary CREATE INDEX, deferring only PostgreSQL's
+    known pending-trigger-events error from Django TestCase.
     """
-    try:
-        with transaction.atomic(), connection.cursor() as cursor:
+    if concurrently is None:
+        concurrently = not connection.in_atomic_block
+    if concurrently and connection.in_atomic_block:
+        raise RuntimeError(
+            'Concurrent search-index builds cannot run inside a transaction.'
+        )
+
+    if concurrently:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT current_setting('maintenance_work_mem')")
+            old_maintenance_work_mem = cursor.fetchone()[0]
             cursor.execute(
-                "SELECT set_config('maintenance_work_mem', %s, true)",
+                "SELECT set_config('maintenance_work_mem', %s, false)",
                 (maintenance_work_mem(),),
             )
-            for _name, ddl in _FAST_MODE_INDEXES:
+        try:
+            for name, ddl in _FAST_MODE_INDEXES:
                 try:
-                    cursor.execute(
-                        ddl.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1)
-                    )
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            ddl.replace(
+                                'CREATE INDEX',
+                                'CREATE INDEX CONCURRENTLY IF NOT EXISTS',
+                                1,
+                            )
+                        )
                 except Exception as exc:
-                    # Pending trigger events inside TestCase — skip this
-                    # index for now; it will be rebuilt outside the test tx.
-                    if 'pending trigger events' in str(exc).lower() or 'objectinuse' in type(exc).__name__.lower():
+                    if _is_pending_trigger_error(exc):
                         continue
-                    # For other errors (e.g., already exists), continue
-                    continue
-    except Exception:
-        # Outer atomic may have failed due to first CREATE; try one by one
-        # without wrapping in atomic, so each DDL gets its own savepoint.
-        for _name, ddl in _FAST_MODE_INDEXES:
-            try:
-                with transaction.atomic(), connection.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT set_config('maintenance_work_mem', %s, true)",
-                        (maintenance_work_mem(),),
-                    )
-                    cursor.execute(
-                        ddl.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1)
-                    )
-            except Exception:
+                    raise RuntimeError(
+                        f'Could not ensure fast-mode search index {name}.'
+                    ) from exc
+        finally:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT set_config('maintenance_work_mem', %s, false)",
+                    (old_maintenance_work_mem,),
+                )
+        return
+
+    for name, ddl in _FAST_MODE_INDEXES:
+        try:
+            with transaction.atomic(), connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT set_config('maintenance_work_mem', %s, true)",
+                    (maintenance_work_mem(),),
+                )
+                cursor.execute(
+                    ddl.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1)
+                )
+        except Exception as exc:
+            if _is_pending_trigger_error(exc):
                 continue
+            raise RuntimeError(
+                f'Could not ensure fast-mode search index {name}.'
+            ) from exc
+
+
+def _normalize_index_definition(definition):
+    """Normalize catalog formatting while retaining columns/operators."""
+    return re.sub(r'[\s()"`]+', '', definition).casefold()
+
+
+def validate_search_indexes():
+    """Raise if any required index is missing, invalid, or has wrong DDL."""
+    expected = dict(_FAST_MODE_INDEXES)
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            SELECT index_class.relname,
+                   index_data.indisvalid,
+                   index_data.indisready,
+                   pg_get_indexdef(index_data.indexrelid)
+              FROM pg_index AS index_data
+              JOIN pg_class AS table_class
+                ON table_class.oid = index_data.indrelid
+              JOIN pg_class AS index_class
+                ON index_class.oid = index_data.indexrelid
+              JOIN pg_namespace AS index_schema
+                ON index_schema.oid = table_class.relnamespace
+             WHERE index_schema.nspname = 'public'
+               AND index_class.relname = ANY(%s::text[])
+        """, (list(expected),))
+        actual = {
+            name: (bool(valid), bool(ready), definition)
+            for name, valid, ready, definition in cursor.fetchall()
+        }
+
+    issues = []
+    for name, ddl in expected.items():
+        found = actual.get(name)
+        if found is None:
+            issues.append(name)
+            continue
+        valid, ready, actual_definition = found
+        expected_definition = re.sub(
+            r'\bON\s+(?!public\.)([a-zA-Z_][a-zA-Z_0-9]*)',
+            r'ON public.\1', ddl, count=1, flags=re.IGNORECASE,
+        )
+        if (
+            not valid
+            or not ready
+            or _normalize_index_definition(actual_definition)
+            != _normalize_index_definition(expected_definition)
+        ):
+            issues.append(name)
+
+    if issues:
+        raise RuntimeError(
+            'Required search-index definitions are missing, invalid, or '
+            'mismatched: ' + ', '.join(sorted(issues))
+        )
+    return True
 
 
 @contextmanager
-def search_indexes_suspended(scope=None):
+def search_indexes_suspended(scope=None, completion_barrier=None):
     """
-    Drop all non-unique search indexes for the duration of the block and
-    always rebuild them afterwards -- including when the block raises.
+    Drop the selected non-unique search indexes for the duration of the block
+    and always rebuild/validate them afterwards -- including when the block
+    raises.
 
     Crash-safe: if the process is SIGKILLed while indexes are dropped,
     the next fast import calls `ensure_search_indexes` in its `finally`
@@ -946,14 +1029,32 @@ def search_indexes_suspended(scope=None):
     slower while suspended; exact lookups still work via seq scan or
     unique indexes.
     """
-    # Rebuild any leftovers from a previous crash before dropping again,
-    # so we don't start with a partially indexed state.
+    # Rebuild and validate leftovers from a previous crash before dropping
+    # anything again, so imports never run on an unknown index state.
     ensure_search_indexes()
-    drop_search_indexes(scope)
+    validate_search_indexes()
     try:
+        # Enter the cleanup scope before dropping the first index: a failure
+        # halfway through a multi-index drop must still rebuild what is missing.
+        drop_search_indexes(scope)
         yield
     finally:
-        ensure_search_indexes()
+        try:
+            ensure_search_indexes()
+            validate_search_indexes()
+        except BaseException:
+            if completion_barrier is not None:
+                completion_barrier.fail()
+            raise
+        else:
+            if (
+                completion_barrier is not None
+                and not completion_barrier.complete()
+            ):
+                raise RuntimeError(
+                    'One or more import jobs could not complete after '
+                    'search-index maintenance.'
+                )
 
 
 def _is_candidate_file(filename, ext="*"):

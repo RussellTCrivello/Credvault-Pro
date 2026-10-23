@@ -1,6 +1,9 @@
 from django.contrib import admin
 
-from .models import Account, Email, Ip, Pass, Url, User
+from .models import (
+    Account, Email, ImportJob, ImportRecord, ImportRecoveryLog,
+    Ip, Pass, Url, User,
+)
 
 
 @admin.register(Url)
@@ -47,11 +50,30 @@ class AccountAdmin(admin.ModelAdmin):
     ]
 
 
-from .models import ImportJob, ImportRecord, ImportRecoveryLog
+class ReadOnlyImportAuditAdmin(admin.ModelAdmin):
+    """Keep the recovery ledger inspectable but immutable in Django admin."""
+
+    actions = None
+
+    def get_readonly_fields(self, request, obj=None):
+        excluded = set(self.get_exclude(request, obj) or ())
+        return tuple(
+            field.name for field in self.model._meta.fields
+            if field.name not in excluded
+        )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(ImportJob)
-class ImportJobAdmin(admin.ModelAdmin):
+class ImportJobAdmin(ReadOnlyImportAuditAdmin):
     list_display = [
         'job_id', 'source_name', 'status', 'stage',
         'total_committed', 'total_skipped', 'total_failed',
@@ -68,7 +90,7 @@ class ImportJobAdmin(admin.ModelAdmin):
 
 
 @admin.register(ImportRecord)
-class ImportRecordAdmin(admin.ModelAdmin):
+class ImportRecordAdmin(ReadOnlyImportAuditAdmin):
     list_display = [
         'id', 'import_job', 'source_position', 'status',
         'account', 'processed_at',
@@ -82,9 +104,11 @@ class ImportRecordAdmin(admin.ModelAdmin):
 
 
 @admin.register(ImportRecoveryLog)
-class ImportRecoveryLogAdmin(admin.ModelAdmin):
+class ImportRecoveryLogAdmin(ReadOnlyImportAuditAdmin):
     list_display = [
         'id', 'import_job', 'attempt_number', 'outcome',
         'recovery_started_at', 'recovery_completed_at',
     ]
     list_filter = ['outcome']
+    # Legacy operator notes may contain unredacted error/source data.
+    exclude = ['notes']

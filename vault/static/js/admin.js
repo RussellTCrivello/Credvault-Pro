@@ -818,6 +818,7 @@ const importJobUI = (() => {
     entry.progress.setAttribute("aria-valuetext", `${data.progress_percent.toFixed(1)}%`);
     entry.percent.textContent = `${data.progress_percent.toFixed(1)}%`;
     entry.counts.textContent = `${label("committedLabel")}: ${importJobUI.number(data.total_committed)}; `
+      + `${label("stagedLabel")}: ${importJobUI.number(data.total_staged)}; `
       + `${label("skippedLabel")}: ${importJobUI.number(data.total_skipped)}; `
       + `${label("failedCountLabel")}: ${importJobUI.number(data.total_failed)}; `
       + `${label("remainingLabel")}: ${importJobUI.number(data.remaining_count)}`;
@@ -949,6 +950,7 @@ const importJobUI = (() => {
   const counterNames = {
     discovered: "total_discovered",
     attempted: "total_attempted",
+    staged: "total_staged",
     committed: "total_committed",
     skipped: "total_skipped",
     failed: "total_failed",
@@ -995,6 +997,7 @@ const importJobUI = (() => {
   const counters = {
     attempted: "total_attempted",
     discovered: "total_discovered",
+    staged: "total_staged",
   };
 
   function updateRow(row, data) {

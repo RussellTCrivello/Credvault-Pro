@@ -54,6 +54,10 @@
         <div data-job-counter="attempted">{{ job.total_attempted }}</div>
       </div>
       <div class="detail-item">
+        <label>{% trans "Pending finalization" %}</label>
+        <div data-job-counter="staged">{{ job.total_staged }}</div>
+      </div>
+      <div class="detail-item">
         <label>{% trans "Committed" %}</label>
         <div class="success-text" data-job-counter="committed">{{ job.total_committed }}</div>
       </div>
@@ -101,6 +105,42 @@
       <p class="vault-note">{% trans "Uploaded bytes are held only by the live request worker. Continue is available while that worker is connected; if it stops or the server restarts, upload the source again to replay unaccounted lines." %}</p>
     {% endif %}
   </section>
+
+  {% if recovery_history %}
+    <section class="vault-panel">
+      <div class="table-toolbar">
+        <div><h2>{% trans "Recovery history" %}</h2></div>
+      </div>
+      <div class="vault-table-wrap">
+        <table class="vault-table">
+          <thead>
+            <tr>
+              <th scope="col">{% trans "Attempt" %}</th>
+              <th scope="col">{% trans "Outcome" %}</th>
+              <th scope="col">{% trans "Committed" %}</th>
+              <th scope="col">{% trans "Pending" %}</th>
+              <th scope="col">{% trans "Failed" %}</th>
+              <th scope="col">{% trans "Started" %}</th>
+              <th scope="col">{% trans "Finished" %}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for recovery in recovery_history %}
+              <tr>
+                <td>{{ recovery.attempt_number }}</td>
+                <td>{{ recovery.get_outcome_display }}</td>
+                <td>{{ recovery.records_committed }}</td>
+                <td>{{ recovery.records_pending }}</td>
+                <td>{{ recovery.records_failed }}</td>
+                <td>{{ recovery.recovery_started_at|date:"Y-m-d H:i:s" }}</td>
+                <td>{{ recovery.recovery_completed_at|date:"Y-m-d H:i:s"|default:"—" }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {% endif %}
 
   {% if recent_failures %}
     <section class="vault-panel">
