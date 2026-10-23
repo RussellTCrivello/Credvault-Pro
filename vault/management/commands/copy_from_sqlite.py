@@ -1,30 +1,26 @@
-"""
-Copy an existing SQLite database into the PostgreSQL database in settings.
+"""Copy a reviewed SQLite snapshot into an empty PostgreSQL database.
 
-    python manage.py migrate --run-syncdb           # create the schema first
-    python manage.py copy_from_sqlite /path/to/db.sqlite3
+The target schema must already be created with ``migrate`` and
+``install_import_pipeline``. The command requires an exact target database-name
+confirmation and wraps the whole data copy in one PostgreSQL transaction.
 
-What it does, all inside one transaction (any failure leaves the target
-unchanged):
+It copies the known vault tables (including import jobs, ledgers, accepted
+staged payloads, and recovery logs) plus Django auth/session/admin data. It
+preserves primary keys, resets sequences, converts SQLite date/time/boolean
+storage, and verifies row counts, account fingerprints, import idempotency
+keys, and staged-row consistency. Unknown source tables/columns, unsupported
+triggers/views, unrecognized indexes, and unpreserved unique-index semantics
+are refused instead of silently discarded. ``django_migrations`` is intentionally
+not copied: the target's own migrations establish its schema history.
 
-  * copies every application table and the Django auth tables, so the admin
-    accounts, groups, permissions, sessions and admin history come across;
-  * keeps the original primary keys, so foreign keys and fingerprints stay
-    valid, and then resets each id sequence past the largest copied id;
-  * converts SQLite's storage format to PostgreSQL types (0/1 to boolean,
-    stored text to timestamps and dates);
-  * checks that every table has the same row count in both databases, and
-    that every stored fingerprint matches the one recomputed from its
-    relations.
-
-The target must be empty for application data. Django's migration history
-(django_migrations) is not copied; create the schema with
-`migrate --run-syncdb` first.
+Take an offline, verified SQLite backup before conversion. The source is opened
+read-only; failures roll back the PostgreSQL data copy and leave the source
+untouched.
 """
 
 import datetime as dt
-import os
 import sqlite3
+from pathlib import Path
 
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection, transaction
@@ -48,7 +44,23 @@ COPY_ORDER = [
     'vault_pass',
     'vault_ip',
     'vault_account',
+    'vault_importjob',
+    'vault_importrecord',
+    'vault_import_stage_record',
+    'vault_importrecoverylog',
 ]
+
+CORE_VAULT_TABLES = {
+    'vault_url', 'vault_email', 'vault_user', 'vault_pass', 'vault_ip',
+    'vault_account',
+}
+
+# These are metadata, not application rows to migrate. In particular, custom
+# PostgreSQL schema history is installed against the target schema separately.
+INTENTIONALLY_OMITTED_TABLES = {
+    'django_migrations', 'sqlite_sequence', 'sqlite_stat1', 'sqlite_stat3',
+    'sqlite_stat4', 'vault_schema_migrations',
+}
 
 # Created automatically by `migrate` (one row per model permission and content
 # type). The copy replaces them with the source rows, keeping the source ids.
@@ -92,72 +104,260 @@ def converter_for(data_type):
 
 class Command(BaseCommand):
     help = (
-        'Copy all data from a SQLite database (the old db.sqlite3) into the '
-        'PostgreSQL database configured in settings. Run '
-        '`migrate --run-syncdb` first.'
+        'Copy a read-only SQLite snapshot into the configured empty PostgreSQL '
+        'database. Run migrate and install_import_pipeline first, and confirm '
+        'the exact target database name.'
     )
 
     def add_arguments(self, parser):
-        parser.add_argument('sqlite_path', help='Path to the SQLite file.')
+        parser.add_argument('sqlite_path', help='Path to the SQLite snapshot.')
+        parser.add_argument(
+            '--confirm-database', required=True,
+            help='Must exactly match current_database(); prevents accidental targeting.',
+        )
         parser.add_argument(
             '--progress-every', type=int, default=1000000,
             help='Print progress after this many rows (default: 1,000,000).',
         )
 
     def handle(self, *args, **options):
-        path = options['sqlite_path']
-        if not os.path.isfile(path):
-            raise CommandError(f'SQLite file not found: {path}')
+        if connection.vendor != 'postgresql':
+            raise CommandError('SQLite conversion requires a PostgreSQL target.')
+        if options['progress_every'] < 0:
+            raise CommandError('--progress-every must be zero or a positive integer.')
 
-        source = sqlite3.connect(f'file:{path}?mode=ro', uri=True)
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT current_database()')
+            database_name = cursor.fetchone()[0]
+        if options['confirm_database'] != database_name:
+            raise CommandError(
+                'Refusing to copy data: pass --confirm-database with the exact '
+                'current PostgreSQL database name.'
+            )
+
+        path = Path(options['sqlite_path']).expanduser()
+        if not path.is_file():
+            raise CommandError(f'SQLite file not found: {path}')
+        path = path.resolve()
+        source = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
         try:
+            source.execute('PRAGMA query_only=ON')
+            # Pin one read snapshot so counts and rows cannot come from
+            # different source states while a live SQLite application writes.
+            source.execute('BEGIN')
             source_tables = {
                 row[0] for row in source.execute(
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
+            unsupported_objects = sorted(
+                f"{kind} {name}"
+                for kind, name in source.execute(
+                    "SELECT type, name FROM sqlite_master "
+                    "WHERE type IN ('trigger', 'view') "
+                    "AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+                )
+            )
+            if unsupported_objects:
+                raise CommandError(
+                    'The SQLite file contains triggers/views not transferred '
+                    'by this data migration: '
+                    + ', '.join(unsupported_objects)
+                    + '. Review and port them explicitly before copying.'
+                )
+            unknown_tables = sorted(
+                source_tables
+                - set(COPY_ORDER)
+                - INTENTIONALLY_OMITTED_TABLES
+            )
+            if unknown_tables:
+                raise CommandError(
+                    'The SQLite file contains tables this migration does not '
+                    'know how to preserve: ' + ', '.join(unknown_tables)
+                    + '. Review and migrate them explicitly; nothing was copied.'
+                )
+            if not source_tables.intersection(CORE_VAULT_TABLES):
+                raise CommandError(
+                    'The SQLite file has no recognized vault application schema; '
+                    'refusing to copy an unrelated database.'
+                )
+            if (
+                'vault_importrecord' in source_tables
+                and 'vault_importjob' not in source_tables
+            ):
+                raise CommandError(
+                    'The SQLite ledger table has no import-job table; '
+                    'review the source schema before copying.'
+                )
+            if (
+                'vault_import_stage_record' in source_tables
+                and 'vault_importrecord' not in source_tables
+            ):
+                raise CommandError(
+                    'The SQLite staging table has no import ledger table; '
+                    'review the source schema before copying.'
+                )
+            if (
+                'vault_importrecoverylog' in source_tables
+                and 'vault_importjob' not in source_tables
+            ):
+                raise CommandError(
+                    'The SQLite recovery log has no import-job table; '
+                    'review the source schema before copying.'
+                )
+            if 'vault_schema_migrations' in source_tables:
+                self.stdout.write(self.style.WARNING(
+                    'SQLite vault_schema_migrations metadata is not copied; '
+                    'the PostgreSQL target must be versioned independently.'
+                ))
+
             with connection.cursor() as cursor:
                 target_tables = set(
                     connection.introspection.table_names(cursor)
                 )
-            missing = [
-                t for t in COPY_ORDER
-                if t in source_tables and t not in target_tables
-            ]
+                cursor.execute("""
+                    SELECT table_class.relname, index_class.relname,
+                           index_details.indisunique,
+                           index_details.indpred IS NOT NULL,
+                           ARRAY(
+                               SELECT COALESCE(attribute.attname, '<expression>')
+                                 FROM unnest(index_details.indkey)
+                                      WITH ORDINALITY AS key_column(attnum, ordinal)
+                                 LEFT JOIN pg_attribute AS attribute
+                                   ON attribute.attrelid = index_details.indrelid
+                                  AND attribute.attnum = key_column.attnum
+                                WHERE key_column.ordinal <= index_details.indnkeyatts
+                                ORDER BY key_column.ordinal
+                           ),
+                           index_details.indexprs IS NOT NULL
+                      FROM pg_index AS index_details
+                      JOIN pg_class AS table_class
+                        ON table_class.oid = index_details.indrelid
+                      JOIN pg_class AS index_class
+                        ON index_class.oid = index_details.indexrelid
+                      JOIN pg_namespace AS namespace
+                        ON namespace.oid = table_class.relnamespace
+                     WHERE namespace.nspname = current_schema()
+                """)
+                target_indexes = {}
+                target_unique_signatures = set()
+                for table, name, unique, partial, columns, expression in cursor.fetchall():
+                    target_indexes[(table, name)] = (bool(unique), bool(partial))
+                    if unique and not partial and not expression:
+                        target_unique_signatures.add((table, tuple(columns)))
+            source_indexes = {}
+            source_unique_signatures = set()
+            unsupported_unique_indexes = []
+            for table in source_tables:
+                for details in source.execute(
+                    f'PRAGMA index_list({_quote(table)})'
+                ):
+                    name, unique, partial = details[1], bool(details[2]), bool(details[4])
+                    if not name.startswith('sqlite_'):
+                        source_indexes[(table, name)] = (unique, partial)
+                    if not unique:
+                        continue
+                    key_columns = [
+                        row for row in source.execute(
+                            f'PRAGMA index_xinfo({_quote(name)})'
+                        ) if row[5]
+                    ]
+                    columns = tuple(row[2] for row in key_columns)
+                    non_binary_collation = any(
+                        (row[4] or '').upper() != 'BINARY'
+                        for row in key_columns
+                    )
+                    if (
+                        partial or any(column is None for column in columns)
+                        or non_binary_collation
+                    ):
+                        unsupported_unique_indexes.append(f'{table}.{name}')
+                    else:
+                        source_unique_signatures.add((table, columns))
+            unrecognized_indexes = sorted(
+                key for key in source_indexes if key not in target_indexes
+            )
+            if unrecognized_indexes:
+                raise CommandError(
+                    'SQLite indexes not represented by the current PostgreSQL '
+                    'schema require an explicit migration: '
+                    + ', '.join(f'{table}.{name}' for table, name in unrecognized_indexes)
+                    + '. Nothing was copied.'
+                )
+            mismatched_indexes = sorted(
+                (table, name) for (table, name), flags in source_indexes.items()
+                if target_indexes[(table, name)] != flags
+            )
+            if mismatched_indexes:
+                raise CommandError(
+                    'SQLite index uniqueness/partial semantics differ from the '
+                    'PostgreSQL target: '
+                    + ', '.join(f'{table}.{name}' for table, name in mismatched_indexes)
+                    + '. Review the schema before copying.'
+                )
+            if unsupported_unique_indexes:
+                raise CommandError(
+                    'SQLite partial, expression, or non-BINARY unique indexes '
+                    'need an explicit PostgreSQL equivalent: '
+                    + ', '.join(sorted(unsupported_unique_indexes))
+                    + '. Nothing was copied.'
+                )
+            missing_unique_indexes = sorted(
+                signature for signature in source_unique_signatures
+                if signature not in target_unique_signatures
+            )
+            if missing_unique_indexes:
+                raise CommandError(
+                    'SQLite unique constraints are not represented by the '
+                    'PostgreSQL target: '
+                    + ', '.join(
+                        f'{table}({", ".join(columns)})'
+                        for table, columns in missing_unique_indexes
+                    )
+                    + '. Nothing was copied.'
+                )
+            missing = [table for table in COPY_ORDER if table not in target_tables]
             if missing:
                 raise CommandError(
-                    'The target database has no schema for: '
+                    'The PostgreSQL target has no schema for: '
                     + ', '.join(missing)
-                    + '. Run `migrate --run-syncdb` first.'
+                    + '. Run `migrate` and install the import pipeline first.'
                 )
 
-            tables = [t for t in COPY_ORDER if t in source_tables]
-            skipped = [t for t in COPY_ORDER if t not in source_tables]
-            if skipped:
-                self.stdout.write(self.style.WARNING(
-                    'Not in the SQLite file, skipped: ' + ', '.join(skipped)
-                ))
-
+            tables = [table for table in COPY_ORDER if table in source_tables]
+            copied = {}
             with transaction.atomic():
                 self._require_empty()
                 self._clear_auto_created()
-                copied = {}
                 with connection.cursor() as cursor:
                     for table in tables:
                         copied[table] = self._copy_table(
                             source, cursor, table, options['progress_every'],
+                        )
+                    missing_core = sorted(CORE_VAULT_TABLES - source_tables)
+                    missing_django = sorted(set(AUTO_CREATED) - source_tables)
+                    if missing_core or missing_django:
+                        missing_tables = missing_core + missing_django
+                        raise CommandError(
+                            'The SQLite snapshot is incomplete; required '
+                            'application tables are missing: '
+                            + ', '.join(missing_tables)
+                            + '. Nothing was copied.'
                         )
                     self._reset_sequences(cursor, tables)
                 self._verify(source, tables)
                 with connection.cursor() as cursor:
                     cursor.execute('ANALYZE')
         finally:
+            if source.in_transaction:
+                source.rollback()
             source.close()
 
         for table in tables:
             self.stdout.write(f'  {table}: {copied[table]:,} rows')
         self.stdout.write(self.style.SUCCESS(
-            'Copy complete. Row counts match and every fingerprint verified.'
+            'Copy complete. Row counts, account fingerprints, import keys, '
+            'and staged-row state verified.'
         ))
 
     # --- steps -------------------------------------------------------------
@@ -224,12 +424,13 @@ class Command(BaseCommand):
                 'Nothing was saved.'
             )
         columns = [c for c in source_cols if c in target]
-        ignored = [c for c in source_cols if c not in target]
-        if ignored:
-            self.stdout.write(self.style.WARNING(
-                f'{table}: columns not in the new schema, not copied: '
-                + ', '.join(ignored)
-            ))
+        unrecognized = [c for c in source_cols if c not in target]
+        if unrecognized:
+            raise CommandError(
+                f'{table}: source-only columns would be lost: '
+                + ', '.join(unrecognized)
+                + '. Review and map them explicitly before copying.'
+            )
         converters = [converter_for(target[c]) for c in columns]
 
         select = (
@@ -292,4 +493,38 @@ class Command(BaseCommand):
                     raise CommandError(
                         f'{bad} records have a fingerprint that does not match '
                         'their relations. Nothing was saved.'
+                    )
+            if 'vault_importrecord' in tables:
+                cursor.execute("""
+                    SELECT COUNT(*)
+                      FROM vault_importrecord AS r
+                      JOIN vault_importjob AS j ON j.id = r.import_job_id
+                     WHERE r.idempotency_key IS DISTINCT FROM encode(
+                         sha256(convert_to(
+                             j.job_id::text || ':' || r.source_position::text,
+                             'UTF8'
+                         )),
+                         'hex'
+                     )
+                """)
+                bad = cursor.fetchone()[0]
+                if bad:
+                    raise CommandError(
+                        f'{bad} import ledger row(s) have an invalid idempotency '
+                        'key. Nothing was saved.'
+                    )
+            if 'vault_import_stage_record' in tables:
+                cursor.execute("""
+                    SELECT COUNT(*)
+                      FROM vault_import_stage_record AS s
+                      JOIN vault_importrecord AS r
+                        ON r.id = s.import_record_id
+                     WHERE r.status NOT IN ('pending', 'processing')
+                       AND NOT (r.status = 'failed' AND r.retryable)
+                """)
+                invalid_stage_rows = cursor.fetchone()[0]
+                if invalid_stage_rows:
+                    raise CommandError(
+                        f'{invalid_stage_rows} staged row(s) do not have a '
+                        'recoverable ledger status. Nothing was saved.'
                     )

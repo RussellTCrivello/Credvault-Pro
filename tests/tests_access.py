@@ -59,7 +59,7 @@ class AdministratorLoginTests(TestCase):
     def test_login_page_is_open_to_anonymous_visitors(self):
         response = self.client.get(self.login_url)
         self.assertEqual(response.status_code, 200)
-        self.assertTemplateUsed(response, 'vault/login.html')
+        self.assertTemplateUsed(response, 'login/login.html')
         self.assertContains(response, 'name="username"')
         self.assertContains(response, 'name="password"')
 

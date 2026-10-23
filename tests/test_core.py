@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import io
 import json
@@ -24,7 +25,9 @@ from vault.import_app.importer import (
     bounded_worker_count, bulk_import_lines, import_work_mem,
     max_pending_parse_chunks, stage_rows, worker_count,
 )
-from vault.models import Account, Email, ImportJob, Ip, Pass, Url, User
+from vault.models import (
+    Account, Email, ImportJob, ImportRecoveryLog, Ip, Pass, Url, User,
+)
 from vault.utils import (
     MAX_SOURCE_LINE_BYTES, OversizedSourceLine, iter_bounded_source_lines,
     parse_line,
@@ -126,6 +129,28 @@ class WorkspaceInterfaceTests(TestCase):
                 )
                 self.assertEqual(response.status_code, 200)
                 self.assertContains(response, expected_text)
+
+    def test_import_job_detail_shows_safe_recovery_history(self):
+        job = ImportJob.objects.create(source_name='synthetic-recovery-source.txt')
+        ImportRecoveryLog.objects.create(
+            import_job=job,
+            attempt_number=1,
+            records_committed=3,
+            records_pending=2,
+            records_failed=1,
+            outcome='partial',
+            notes='Synthetic secret text must remain hidden.',
+        )
+
+        response = self.client.get(
+            reverse('vault:import_job_detail', args=[job.job_id])
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'Recovery history')
+        self.assertContains(response, 'Partial')
+        self.assertContains(response, '3')
+        self.assertNotContains(response, 'Synthetic secret text must remain hidden.')
 
     def test_record_detail_intro_shows_the_url_and_identifier(self):
         response = self.client.get(
@@ -1036,6 +1061,36 @@ class WorkspaceInterfaceTests(TestCase):
         content = b''.join(response.streaming_content)
         self.assertIn(b'person@example.com', content)
         self.assertIn(b'203.0.113.10', content)
+
+    def test_csv_export_neutralizes_formula_like_values_but_json_stays_exact(self):
+        from vault.views import _safe_csv_cell
+
+        self.assertEqual(_safe_csv_cell(''), '')
+        self.assertEqual(_safe_csv_cell('\t=1+1'), "'\t=1+1")
+        self.assertEqual(_safe_csv_cell('\x00=1+1'), "'\x00=1+1")
+        self.assertEqual(_safe_csv_cell('\ufeff=1+1'), "'\ufeff=1+1")
+        formula_password = '=HYPERLINK("https://attacker.invalid")'
+        password = Pass.objects.create(name=formula_password)
+        Account.objects.create(
+            url=self.url,
+            account_type='email',
+            email=self.email,
+            password=password,
+            ip=self.ip,
+        )
+
+        csv_response = self.client.get(reverse('vault:export_csv'))
+        rows = list(csv.DictReader(io.StringIO(csv_response.content.decode('utf-8'))))
+        exported = next(row for row in rows if row['Password'].endswith('attacker.invalid")'))
+        self.assertEqual(exported['Password'], "'" + formula_password)
+        self.assertEqual(Pass.objects.get(pk=password.pk).name, formula_password)
+
+        json_response = self.client.get(reverse('vault:export_json'))
+        exported_json = json.loads(json_response.content.decode('utf-8'))
+        self.assertIn(
+            formula_password,
+            [record['password'] for record in exported_json],
+        )
 
     def test_export_exports_all_matching_results_beyond_first_page(self):
         lines = [

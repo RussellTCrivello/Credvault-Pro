@@ -44,7 +44,7 @@
                   <div data-job-progress style="width: {{ job.progress_percent }}%; background: currentColor; height: 8px; border-radius: 4px;"></div>
                 </div>
                 <span data-job-progress-label>{{ job.progress_percent|floatformat:1 }}%</span>
-                <small class="cell-secondary"><span data-job-counter="attempted">{{ job.total_attempted }}</span> / <span data-job-counter="discovered">{{ job.total_discovered }}</span> {% trans "lines" %}</small>
+                <small class="cell-secondary"><span data-job-counter="attempted">{{ job.total_attempted }}</span> / <span data-job-counter="discovered">{{ job.total_discovered }}</span> {% trans "lines" %}; <span data-job-counter="staged">{{ job.total_staged }}</span> {% trans "staged" %}</small>
               </td>
               <td>{{ job.created_at|date:"Y-m-d H:i" }}</td>
               <td>
